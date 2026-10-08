@@ -858,7 +858,8 @@ void android_input_init(so_module *mod, _JNIEnv *env, int width, int height)
           (void *)g_on_key_down, (void *)g_touch_event,
           (void *)g_left_stick, (void *)g_right_stick, (void *)g_is_main_menu);
 
-    SDL_GameControllerOpen(0);
+    if (!gl_bridge_enabled())
+        SDL_GameControllerOpen(0);
 }
 
 /*

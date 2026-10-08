@@ -835,3 +835,88 @@
 +#endif
 +
  #endif /* SOFTFLOAT_H */
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -59,6 +59,74 @@
+ #include "tcg/perf.h"
+ #include "exec/page-vary.h"
+ 
++/*
++ * NOVA3 Android build: QEMU_GUEST_PROF=1 samples the guest PC of the main guest thread every
++ * millisecond and prints, every 10 s, the most frequent addresses (rounded to 4 bytes) on stderr:
++ *   QEMU_GUEST_PROF: <samples> top: 0x<pc>=<n> ...
++ * Map them to functions offline with the guest ELF symbols. The PC is only as precise as the
++ * translated block (it is stored when a block ends), which is plenty to tell functions apart.
++ */
++#define NOVA3_PROF_SLOTS 16384
++static void *nova3_guest_prof(void *arg)
++{
++    static uint32_t key[NOVA3_PROF_SLOTS], cnt[NOVA3_PROF_SLOTS];
++    uint32_t total = 0;
++    int64_t t0 = g_get_monotonic_time();
++    (void)arg;
++    for (;;) {
++        g_usleep(1000);
++        CPUState *cs = first_cpu;
++        if (cs) {
++            uint32_t pc = (uint32_t)cs->cc->get_pc(cs) & ~3u;
++            uint32_t h = (pc * 2654435761u) >> 18;
++            for (int probe = 0; probe < 64; probe++, h = (h + 1) & (NOVA3_PROF_SLOTS - 1)) {
++                if (cnt[h] == 0) {
++                    key[h] = pc;
++                    cnt[h] = 1;
++                    break;
++                }
++                if (key[h] == pc) {
++                    cnt[h]++;
++                    break;
++                }
++            }
++            total++;
++        }
++        int64_t now = g_get_monotonic_time();
++        if (now - t0 < 10 * G_USEC_PER_SEC) {
++            continue;
++        }
++        t0 = now;
++        fprintf(stderr, "QEMU_GUEST_PROF: %u top:", total);
++        for (int k = 0; k < 60; k++) {
++            int best = -1;
++            for (int i = 0; i < NOVA3_PROF_SLOTS; i++) {
++                if (cnt[i] && (best < 0 || cnt[i] > cnt[best])) {
++                    best = i;
++                }
++            }
++            if (best < 0) {
++                break;
++            }
++            fprintf(stderr, " 0x%x=%u", key[best], cnt[best]);
++            cnt[best] = 0;
++        }
++        fprintf(stderr, "\n");
++        memset(cnt, 0, sizeof(cnt));
++        total = 0;
++    }
++    return NULL;
++}
++
++static void nova3_guest_prof_start(void)
++{
++    const char *v = getenv("QEMU_GUEST_PROF");
++    if (v && *v && *v != '0') {
++        GThread *t = g_thread_new("guest-prof", nova3_guest_prof, NULL);
++        g_thread_unref(t);
++    }
++}
++
+ #ifdef CONFIG_SEMIHOSTING
+ #include "semihosting/semihost.h"
+ #endif
+@@ -1007,6 +1075,7 @@
+     qemu_semihosting_guestfd_init();
+ #endif
+ 
++    nova3_guest_prof_start();
+     cpu_loop(env);
+     /* never exits */
+     return 0;

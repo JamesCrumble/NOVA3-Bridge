@@ -238,8 +238,10 @@ static inline void gb_put(int32_t *d, unsigned v) { *d = (int32_t)v; }
 static inline void gb_put(int32_t *d, unsigned char v) { *d = v; }
 static inline void gb_put(int32_t *d, float v) { memcpy(d, &v, 4); }
 
-/* Frames sent but not yet presented by the host; the guest may run one frame ahead, no more. */
+/* Frames sent but not yet presented by the host; the guest may run <PREFIX>_GL_INFLIGHT frames ahead
+ * (default 2: while the host replays one frame and waits for vsync, the guest already builds the next). */
 static int g_inflight = 0;
+static int g_max_inflight = 2;
 static const uint32_t kAck = 0xFFFFFFFFu;
 
 /* Next reply length, absorbing frame acknowledgements that arrive in between. */
@@ -1375,7 +1377,14 @@ extern "C" int gl_bridge_init(void)
         fatal("GL bridge: cannot open the pipes (%s, %s): %s", cmd, rep, strerror(errno));
         return 0;
     }
-    trace("gl bridge: connected (%s, %s)", cmd, rep);
+    g_max_inflight = (int)port_getenv_long("GL_INFLIGHT", 2);
+    if (g_max_inflight < 1)
+        g_max_inflight = 1;
+    /* A bigger command pipe lets the guest write ahead while the host is busy with the previous frame. */
+    long kb = port_getenv_long("GL_PIPE_KB", 1024);
+    int got = fcntl(g_cmd_fd, 1031 /* F_SETPIPE_SZ */, (int)(kb * 1024));
+    trace("gl bridge: connected (%s, %s), %d frame(s) in flight, command pipe %d KB", cmd, rep,
+          g_max_inflight, got > 0 ? got / 1024 : -1);
     return 1;
 }
 
@@ -1414,7 +1423,7 @@ extern "C" void gl_bridge_swap(void)
     g_inflight++;
     /* The flush above is bridge time; the wait below is the host's. */
     uint64_t w0 = g_profile > 0 ? now_ns() : 0;
-    while (g_inflight > 1) {
+    while (g_inflight > g_max_inflight) {
         uint32_t v = 0;
         read_all(&v, 4);
         if (v != kAck) {

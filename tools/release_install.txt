@@ -1,0 +1,28 @@
+NOVA3 Bridge - установка
+========================
+
+N.O.V.A. 3 (Gameloft, v1.0.7, только 32-бит) на 64-битном телефоне через qemu-user и проброс GLES на GPU.
+
+1. Установить NOVA3-Bridge-<версия>.apk (приложение "N.O.V.A. 3", пакет com.eaprules.nova3).
+
+2. Положить файлы игры (по adb или любым файловым менеджером):
+
+   /sdcard/Android/data/com.eaprules.nova3/files/
+       N-O-V-A-3-Near-Orbit-Vanguard-Alliance-v1-0-7.apk      (оригинальный APK игры)
+
+   /sdcard/Android/obb/com.eaprules.nova3/
+       main.1050.com.gameloft.android.ANMP.GloftN3HM.obb
+       patch.1070.com.gameloft.android.ANMP.GloftN3HM.obb
+
+   Пример:
+       adb push N-O-V-A-3-Near-Orbit-Vanguard-Alliance-v1-0-7.apk /sdcard/Android/data/com.eaprules.nova3/files/
+       adb shell mkdir -p /sdcard/Android/obb/com.eaprules.nova3
+       adb push main.1050.com.gameloft.android.ANMP.GloftN3HM.obb /sdcard/Android/obb/com.eaprules.nova3/
+       adb push patch.1070.com.gameloft.android.ANMP.GloftN3HM.obb /sdcard/Android/obb/com.eaprules.nova3/
+
+3. Открыть приложение: сначала появятся настройки (угол обзора, разрешение, качество, ядра),
+   кнопка "Играть" запускает игру. Первый запуск дольше: распаковывается sysroot (~100 МБ)
+   и ассеты игры.
+
+Исходники - NOVA3-Bridge-<версия>-src.zip (сборка описана в README.md и port/android/README.md).
+Контрольные суммы - SHA256SUMS.

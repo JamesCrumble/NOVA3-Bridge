@@ -95,6 +95,8 @@ final class GameProcess {
         android.util.DisplayMetrics m = ctx.getResources().getDisplayMetrics();
         int longSide = Math.max(m.widthPixels, m.heightPixels), shortSide = Math.min(m.widthPixels, m.heightPixels);
         int h = 720;
+        try { h = Integer.parseInt(SettingsActivity.load(ctx).getOrDefault("RENDER_HEIGHT", "720")); } catch (NumberFormatException ignored) { }
+        h = Math.max(240, Math.min(h, 2160)) & ~1;
         int w = Math.round(h * (float) longSide / shortSide) & ~1;
         String over = readText(new File(logFile.getParentFile(), "resolution.txt")).trim();
         java.util.regex.Matcher mt = java.util.regex.Pattern.compile("(\\d+)x(\\d+)").matcher(over);
@@ -303,8 +305,15 @@ final class GameProcess {
             int eq = line.indexOf('=');
             if (eq > 0 && !line.trim().startsWith("#")) env.put(line.substring(0, eq).trim(), line.substring(eq + 1).trim());
         }
+        // settings.txt is written by SettingsActivity and wins over engine_env.txt (RENDER_HEIGHT is ours, not the engine's).
+        for (java.util.Map.Entry<String, String> e : SettingsActivity.load(ctx).entrySet())
+            if (!e.getKey().equals("RENDER_HEIGHT") && !e.getKey().startsWith("Q_") && !e.getKey().equals("CPU_PRIME")) env.put(e.getKey(), e.getValue());
+        applyQualityOverrides(dir, overrides, env);
         // Our qemu: guest syscall counts every 10 s in the log (which ones leave translated code most often).
         env.put("QEMU_SYSCALL_STATS", "1");
+        // Guest-function profile: qemu samples the game's PC (tools/guest_prof.py maps it to functions).
+        // engine_env.txt with QEMU_GUEST_PROF=0 turns it off.
+        env.put("QEMU_GUEST_PROF", "1");
         // glibc 2.35+ registers rseq at startup; Android's seccomp filter may kill the process for it.
         env.put("GLIBC_TUNABLES", "glibc.pthread.rseq=0");
         File home = new File(root, "home");
@@ -323,6 +332,7 @@ final class GameProcess {
         // cores. The frequency limiter caps clusters differently from moment to moment, and the scheduler keeps
         // moving the game's one busy thread onto whichever is free - often a capped one.
         String mask = readText(new File(logFile.getParentFile(), "cpu_mask.txt")).trim();
+        if ("1".equals(SettingsActivity.load(ctx).get("CPU_PRIME"))) mask = "c0";
         if (diag.exists()) mask = "";
         if (mask.matches("[0-9a-fA-F]{1,4}")) {
             b.command().add(0, "/system/bin/taskset");
@@ -492,6 +502,45 @@ final class GameProcess {
         int j = i;
         while (j < s.length() && Character.isDigit(s.charAt(j))) j++;
         try { return Integer.parseInt(s.substring(i, j)); } catch (NumberFormatException e) { return 0; }
+    }
+
+    /**
+     * The menu's quality options are text substitutions on the engine's option XML (the same mechanism as
+     * xml_override.txt, whose lines are kept): "old=>new" per line, applied to every document before parsing.
+     */
+    private void applyQualityOverrides(File dir, File manual, java.util.Map<String, String> env) {
+        java.util.Map<String, String> m = SettingsActivity.load(ctx);
+        StringBuilder sb = new StringBuilder(readText(manual));
+        if (sb.length() > 0 && sb.charAt(sb.length() - 1) != '\n') sb.append('\n');
+        int n = 0;
+        if ("0".equals(m.get("Q_SHADOWS"))) { sb.append("name=\"Shadows\" value=\"true\"=>name=\"Shadows\" value=\"false\"\n"); n++; }
+        if ("0".equals(m.get("Q_POST"))) {
+            for (String fx : new String[] { "Refracted Objects", "Global DOF", "Height Fog", "Radial Blur", "Heat Haze", "Hurt Distort", "Hurt Old" }) {
+                sb.append("name=\"Post Effects - " + fx + "\" value=\"true\"=>name=\"Post Effects - " + fx + "\" value=\"false\"\n");
+            }
+            n++;
+        }
+        String lod = m.get("Q_LOD");
+        if (lod != null && !lod.equals("100")) {
+            try {
+                sb.append("name=\"LOD distance factor\" range=\"[0.01,1.0]\" value=\"1.000000\"=>name=\"LOD distance factor\" range=\"[0.01,1.0]\" value=\""
+                        + String.format(java.util.Locale.US, "%.3f", Integer.parseInt(lod) / 100f) + "\"\n");
+                n++;
+            } catch (NumberFormatException ignored) { }
+        }
+        String det = m.get("Q_DETAILS");
+        if (det != null && !det.equals("0")) {
+            sb.append("name=\"Details level\" range=\"[0,2]\" value=\"0\"=>name=\"Details level\" range=\"[0,2]\" value=\"" + det + "\"\n");
+            n++;
+        }
+        if (n == 0) return;
+        File out = new File(dir, "xml_override_menu.txt");
+        try (java.io.FileOutputStream fo = new java.io.FileOutputStream(out)) {
+            fo.write(sb.toString().getBytes("UTF-8"));
+            env.put("NOVA3_XML_OVERRIDES", out.getPath());
+        } catch (IOException e) {
+            appendLog("[app] quality overrides not written: " + e);
+        }
     }
 
     private static String readText(File f) {

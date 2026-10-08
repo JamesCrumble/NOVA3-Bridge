@@ -255,8 +255,12 @@ int main(int argc, char **argv)
     SDL_Window   *window = NULL;
     SDL_GLContext gl     = NULL;
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
-        trace("SDL_Init(video+gamecontroller) failed: %s", SDL_GetError());
+    /* Under the Android wrapper the pads are read by the Java side and arrive as commands; SDL's own
+     * joystick subsystem would only keep probing for libudev (hundreds of failed opens a second,
+     * each a guest syscall out of translated code). */
+    const Uint32 sdl_flags = SDL_INIT_VIDEO | (gl_bridge_enabled() ? 0 : SDL_INIT_GAMECONTROLLER);
+    if (SDL_Init(sdl_flags) != 0) {
+        trace("SDL_Init(0x%x) failed: %s", sdl_flags, SDL_GetError());
     } else {
         SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
         SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
@@ -357,6 +361,11 @@ int main(int argc, char **argv)
 
     trace("so_load_module returned (text_base=%p size=%zu)",
           (void *)mod->text_base, (size_t)mod->text_size);
+    /* Lets a guest-PC profile (QEMU_GUEST_PROF) be mapped back to this executable's symbols. */
+    trace("port main() is at %p", (void *)&main);
+    trace("libc addrs: memcpy=%p memset=%p strlen=%p sinf=%p mutex_lock=%p",
+          (void *)&memcpy, (void *)&memset, (void *)&strlen, (void *)(float (*)(float))&sinf,
+          (void *)&pthread_mutex_lock);
 
     /* ---------------------------------------------------------------- *
      * The boot sequence, in the game's own order.

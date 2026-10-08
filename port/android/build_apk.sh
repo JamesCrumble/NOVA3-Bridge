@@ -76,14 +76,28 @@ python3 android/ziptool.py append "$OUT/base.ap_" "$OUT/unsigned.apk" \
     "D:classes.dex=$OUT/dex/classes.dex"
 
 # Kept outside $OUT so rebuilt APKs keep the same signature and update in place.
-KEY="$ROOT/android/build/debug.keystore"
-if [ ! -f "$KEY" ]; then
-    keytool -genkeypair -keystore "$KEY" -storepass android -keypass android \
-        -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
-        -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
+# RELEASE=1 signs with the release key (android/build/release.keystore, created on first use; keep a copy of it:
+# a different key means the app has to be uninstalled before an update) and names the file NOVA3-Bridge-<version>.apk.
+if [ "${RELEASE:-0}" = 1 ]; then
+    KEY="$ROOT/android/build/release.keystore"
+    PASSFILE="$ROOT/android/build/release.pass"
+    if [ ! -f "$KEY" ]; then
+        head -c 18 /dev/urandom | base64 | tr -d '/+=' > "$PASSFILE"
+        keytool -genkeypair -keystore "$KEY" -storepass "$(cat "$PASSFILE")" -keypass "$(cat "$PASSFILE")"             -alias nova3bridge -keyalg RSA -keysize 4096 -validity 36500             -dname "CN=NOVA3 Bridge,O=JamesCrumble,C=RU" >/dev/null 2>&1
+    fi
+    VER=$(grep -o 'versionName="[^"]*"' "$ROOT/android/AndroidManifest.xml" | head -1 | cut -d'"' -f2)
+    APK_OUT="$ROOT/NOVA3-Bridge-$VER.apk"
+    PASS=$(cat "$PASSFILE")
+    "$BT/zipalign" -f -p 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
+    "$BT/apksigner" sign --ks "$KEY" --ks-pass "pass:$PASS" --key-pass "pass:$PASS" --ks-key-alias nova3bridge         --out "$APK_OUT" "$OUT/aligned.apk"
+else
+    KEY="$ROOT/android/build/debug.keystore"
+    if [ ! -f "$KEY" ]; then
+        keytool -genkeypair -keystore "$KEY" -storepass android -keypass android             -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000             -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
+    fi
+    APK_OUT="$ROOT/NOVA3-ARM32-debug.apk"
+    "$BT/zipalign" -f -p 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
+    "$BT/apksigner" sign --ks "$KEY" --ks-pass pass:android --out "$APK_OUT" "$OUT/aligned.apk"
 fi
-"$BT/zipalign" -f -p 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
-"$BT/apksigner" sign --ks "$KEY" --ks-pass pass:android \
-    --out "$ROOT/NOVA3-ARM32-debug.apk" "$OUT/aligned.apk"
-"$BT/apksigner" verify --verbose "$ROOT/NOVA3-ARM32-debug.apk"
-echo "APK: $ROOT/NOVA3-ARM32-debug.apk"
+"$BT/apksigner" verify --verbose "$APK_OUT"
+echo "APK: $APK_OUT"

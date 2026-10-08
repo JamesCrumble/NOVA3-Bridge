@@ -37,7 +37,7 @@ Oryon, только AArch64, Android/OxygenOS 15+), подключён по USB,
 - `resolution.txt`, `pad_overlay.flag`, `notrace.flag`, `qemu_args.txt`, `diag_cmd.txt`, `xmldump.flag`, `xml_override.txt`.
 - Переменные порта: `NOVA3_GAME_LOG=1` (все логи игры), `NOVA3_READPIXELS_EVERY`, `NOVA3_PROGRAM_INFO=0`,
   `NOVA3_PHYSICS_THREAD`, `NOVA3_GL_PROFILE=1|2`; qemu: `QEMU_STRICT_FP=1` (выключить быстрый float).
-- TODO: меню настроек в APK вместо этих файлов.
+- Меню настроек в APK сделано (SettingsActivity: FOV, разрешение до 720p, кадры в полёте, физика, профилирование; settings.txt).
 
 ## Сборка и инструменты (tools/, запуск: `wsl -d Ubuntu-20.04 --cd /home/james -e sh nova3probe/tools/run.sh nova3probe/tools/<x>.sh`)
 - `build_install.sh noinstall` — порт + APK (берёт свой qemu из `qemu-build/out/`, если есть).
@@ -105,3 +105,6 @@ P2: HLE-обёртки в qemu (zlib inflate игры — загрузки, memc
 ## Известные проблемы
 - Заставка на титульном экране рисуется в левом верхнем углу (причина не найдена; меню и игра — во весь экран).
 - Загрузки долгие (эмуляция распаковки).
+- TODO: разобрать редкое зависание на экране загрузки (2026-10-08, сразу после инициализации звука: главный гостевой поток
+  в futex, CPU простаивает, фаза LOADING frame=0; один раз, повторить не удалось). Подозрение: наша ldrex/strex-замена
+  kuser cmpxchg (NOVA3_FAST_CAS=0 отключает) или старая гонка при старте. Смотреть лог такого запуска и стек потоков.

@@ -22,3 +22,6 @@
 __pycache__/
 *.apk
 *.idsig
+/scratch/
+/release/
+/port/android/build/release.*
