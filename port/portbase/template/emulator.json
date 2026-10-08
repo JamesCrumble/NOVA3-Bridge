@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "Copy this to the root of your port and fill it in. the emulator harness reads it to",
+    "know which game it is driving; nothing else in the emulator names a game.",
+    "",
+    "binary     the name under build/ that the Makefile produces (PORT_NAME).",
+    "env_prefix the prefix every runtime switch uses (ENV_PREFIX in the Makefile).",
+    "           These two MUST match the Makefile or the server will look for a",
+    "           binary that is not there and blame the donor.",
+    "guest_so   the game's own library inside the donor tree, used to tell",
+"              a missing donor apart from an unexpected layout.",
+    "controls   the device controls this port answers to. Drop the ones the",
+    "           handheld does not have; adding a name the loader ignores makes",
+    "           press_control succeed silently, which reads as an engine bug.",
+    "panel      default screen size. set_panel overrides it per session, to test",
+    "           the fit/stretch/integer mapping on panels you do not own."
+  ],
+
+  "name": "Gunman Clive",
+  "binary": "gunmanclive",
+  "env_prefix": "GUNMANCLIVE",
+  "guest_so": "lib/armeabi-v7a/libGunmanClive.so",
+
+  "controls": [
+    "a", "b", "x", "y",
+    "l1", "l2", "r1", "r2",
+    "start", "select",
+    "up", "down", "left", "right"
+  ],
+
+  "panel": { "w": 640, "h": 480 }
+}

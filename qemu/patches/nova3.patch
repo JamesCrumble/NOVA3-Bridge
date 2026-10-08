@@ -1,0 +1,837 @@
+--- a/fpu/softfloat.c
++++ b/fpu/softfloat.c
+@@ -230,6 +230,7 @@
+ 
+ static inline bool can_use_fpu(const float_status *s)
+ {
++    nova3_fpcr_default();
+     if (QEMU_NO_HARDFLOAT) {
+         return false;
+     }
+@@ -238,6 +239,215 @@
+ }
+ 
+ /*
++ * Fast host FP (NOVA3 Android build).
++ *
++ * The host is AArch64, whose IEEE arithmetic, NaN propagation and saturating
++ * float->int conversions are the same rules ARMv7 VFP/Neon uses. With the
++ * host FPCR at its default (round to nearest, no flush, no default NaN), an
++ * instruction-for-instruction host op gives the guest's result directly;
++ * Neon's "standard FPSCR" (flush to zero, default NaN) is applied around it.
++ * What is not produced are the cumulative exception flags in FPSCR, which
++ * games never read. Other rounding modes take the softfloat path.
++ *
++ * QEMU_STRICT_FP=1 in the environment turns this off.
++ */
++#if defined(__aarch64__)
++static bool fastfp_on = true;
++
++static void __attribute__((constructor)) fastfp_init(void)
++{
++    const char *v = getenv("QEMU_STRICT_FP");
++    fastfp_on = !(v && *v && *v != '0');
++}
++
++__thread bool nova3_fpcr_std;
++__thread uint64_t nova3_fpcr_default_val;
++
++static inline bool fastfp(const float_status *s)
++{
++    nova3_fpcr_default();
++    return likely(fastfp_on) &&
++           likely(s->float_rounding_mode == float_round_nearest_even);
++}
++
++static inline float32 ff32_in(float32 a, const float_status *s)
++{
++    if (unlikely(s->flush_inputs_to_zero) && float32_is_denormal(a)) {
++        return float32_set_sign(float32_zero, float32_is_neg(a));
++    }
++    return a;
++}
++
++static inline float32 ff32_out(float32 r, float_status *s)
++{
++    if (unlikely(s->flush_to_zero) && float32_is_denormal(r)) {
++        return float32_set_sign(float32_zero, float32_is_neg(r));
++    }
++    if (unlikely(s->default_nan_mode) && float32_is_any_nan(r)) {
++        return float32_default_nan(s);
++    }
++    return r;
++}
++
++static inline float64 ff64_in(float64 a, const float_status *s)
++{
++    if (unlikely(s->flush_inputs_to_zero) && float64_is_denormal(a)) {
++        return float64_set_sign(float64_zero, float64_is_neg(a));
++    }
++    return a;
++}
++
++static inline float64 ff64_out(float64 r, float_status *s)
++{
++    if (unlikely(s->flush_to_zero) && float64_is_denormal(r)) {
++        return float64_set_sign(float64_zero, float64_is_neg(r));
++    }
++    if (unlikely(s->default_nan_mode) && float64_is_any_nan(r)) {
++        return float64_default_nan(s);
++    }
++    return r;
++}
++
++/* One host instruction on raw bit patterns; operand order is kept exactly,
++ * which is what decides which NaN propagates. */
++#define FF32_OP2(name, insn)                                                \
++static inline float32 name(float32 a, float32 b, float_status *s)          \
++{                                                                           \
++    uint32_t ra = float32_val(ff32_in(a, s)), rb = float32_val(ff32_in(b, s)); \
++    float fa, fb, fr;                                                       \
++    uint32_t rr;                                                            \
++    memcpy(&fa, &ra, 4);                                                    \
++    memcpy(&fb, &rb, 4);                                                    \
++    asm(insn " %s0, %s1, %s2" : "=w"(fr) : "w"(fa), "w"(fb));               \
++    memcpy(&rr, &fr, 4);                                                    \
++    return ff32_out(make_float32(rr), s);                                   \
++}
++
++#define FF64_OP2(name, insn)                                                \
++static inline float64 name(float64 a, float64 b, float_status *s)          \
++{                                                                           \
++    uint64_t ra = float64_val(ff64_in(a, s)), rb = float64_val(ff64_in(b, s)); \
++    double fa, fb, fr;                                                      \
++    uint64_t rr;                                                            \
++    memcpy(&fa, &ra, 8);                                                    \
++    memcpy(&fb, &rb, 8);                                                    \
++    asm(insn " %d0, %d1, %d2" : "=w"(fr) : "w"(fa), "w"(fb));               \
++    memcpy(&rr, &fr, 8);                                                    \
++    return ff64_out(make_float64(rr), s);                                   \
++}
++
++FF32_OP2(ff32_add, "fadd")
++FF32_OP2(ff32_sub, "fsub")
++FF32_OP2(ff32_mul, "fmul")
++FF32_OP2(ff32_div, "fdiv")
++FF64_OP2(ff64_add, "fadd")
++FF64_OP2(ff64_sub, "fsub")
++FF64_OP2(ff64_mul, "fmul")
++FF64_OP2(ff64_div, "fdiv")
++
++/* Fused a*b+c with qemu's negation flags; anything else stays soft. */
++static inline bool ff_muladd_flags_ok(int flags)
++{
++    return !(flags & ~(float_muladd_negate_c | float_muladd_negate_product |
++                       float_muladd_negate_result));
++}
++
++static inline float32 ff32_muladd(float32 a, float32 b, float32 c, int flags,
++                                  float_status *s)
++{
++    uint32_t ra = float32_val(ff32_in(a, s)), rb = float32_val(ff32_in(b, s));
++    uint32_t rc = float32_val(ff32_in(c, s)), rr;
++    float fa, fb, fc, fr;
++    if (flags & float_muladd_negate_product) {
++        ra ^= 0x80000000u;
++    }
++    if (flags & float_muladd_negate_c) {
++        rc ^= 0x80000000u;
++    }
++    memcpy(&fa, &ra, 4);
++    memcpy(&fb, &rb, 4);
++    memcpy(&fc, &rc, 4);
++    asm("fmadd %s0, %s1, %s2, %s3" : "=w"(fr) : "w"(fa), "w"(fb), "w"(fc));
++    memcpy(&rr, &fr, 4);
++    float32 r = ff32_out(make_float32(rr), s);
++    return (flags & float_muladd_negate_result) ? float32_chs(r) : r;
++}
++
++static inline float64 ff64_muladd(float64 a, float64 b, float64 c, int flags,
++                                  float_status *s)
++{
++    uint64_t ra = float64_val(ff64_in(a, s)), rb = float64_val(ff64_in(b, s));
++    uint64_t rc = float64_val(ff64_in(c, s)), rr;
++    double fa, fb, fc, fr;
++    if (flags & float_muladd_negate_product) {
++        ra ^= 0x8000000000000000ull;
++    }
++    if (flags & float_muladd_negate_c) {
++        rc ^= 0x8000000000000000ull;
++    }
++    memcpy(&fa, &ra, 8);
++    memcpy(&fb, &rb, 8);
++    memcpy(&fc, &rc, 8);
++    asm("fmadd %d0, %d1, %d2, %d3" : "=w"(fr) : "w"(fa), "w"(fb), "w"(fc));
++    memcpy(&rr, &fr, 8);
++    float64 r = ff64_out(make_float64(rr), s);
++    return (flags & float_muladd_negate_result) ? float64_chs(r) : r;
++}
++
++/* Conversions: fcvtz[su] saturate and turn NaN into 0, exactly like VCVT. */
++static inline int32_t ff32_to_i32_rtz(float32 a, const float_status *s)
++{
++    uint32_t ra = float32_val(ff32_in(a, s));
++    float fa;
++    int32_t r;
++    memcpy(&fa, &ra, 4);
++    asm("fcvtzs %w0, %s1" : "=r"(r) : "w"(fa));
++    return r;
++}
++
++static inline uint32_t ff32_to_u32_rtz(float32 a, const float_status *s)
++{
++    uint32_t ra = float32_val(ff32_in(a, s));
++    float fa;
++    uint32_t r;
++    memcpy(&fa, &ra, 4);
++    asm("fcvtzu %w0, %s1" : "=r"(r) : "w"(fa));
++    return r;
++}
++
++static inline int32_t ff32_to_i32_rne(float32 a, const float_status *s)
++{
++    uint32_t ra = float32_val(ff32_in(a, s));
++    float fa;
++    int32_t r;
++    memcpy(&fa, &ra, 4);
++    asm("fcvtns %w0, %s1" : "=r"(r) : "w"(fa));
++    return r;
++}
++
++static inline float32 ff_i32_to_f32(int32_t a, float_status *s)
++{
++    float fr;
++    uint32_t rr;
++    asm("scvtf %s0, %w1" : "=w"(fr) : "r"(a));
++    memcpy(&rr, &fr, 4);
++    return make_float32(rr);
++}
++
++static inline float32 ff_u32_to_f32(uint32_t a, float_status *s)
++{
++    float fr;
++    uint32_t rr;
++    asm("ucvtf %s0, %w1" : "=w"(fr) : "r"(a));
++    memcpy(&rr, &fr, 4);
++    return make_float32(rr);
++}
++#define FASTFP(cond, expr) do { if (fastfp(s) && (cond)) { return (expr); } } while (0)
++#else
++#define FASTFP(cond, expr) do { } while (0)
++#endif
++
++/*
+  * Hardfloat generation functions. Each operation can have two flavors:
+  * either using softfloat primitives (e.g. float32_is_zero_or_normal) for
+  * most condition checks, or native ones (e.g. fpclassify).
+@@ -1707,24 +1917,28 @@
+ float32 QEMU_FLATTEN
+ float32_add(float32 a, float32 b, float_status *s)
+ {
++    FASTFP(true, ff32_add(a, b, s));
+     return float32_addsub(a, b, s, hard_f32_add, soft_f32_add);
+ }
+ 
+ float32 QEMU_FLATTEN
+ float32_sub(float32 a, float32 b, float_status *s)
+ {
++    FASTFP(true, ff32_sub(a, b, s));
+     return float32_addsub(a, b, s, hard_f32_sub, soft_f32_sub);
+ }
+ 
+ float64 QEMU_FLATTEN
+ float64_add(float64 a, float64 b, float_status *s)
+ {
++    FASTFP(true, ff64_add(a, b, s));
+     return float64_addsub(a, b, s, hard_f64_add, soft_f64_add);
+ }
+ 
+ float64 QEMU_FLATTEN
+ float64_sub(float64 a, float64 b, float_status *s)
+ {
++    FASTFP(true, ff64_sub(a, b, s));
+     return float64_addsub(a, b, s, hard_f64_sub, soft_f64_sub);
+ }
+ 
+@@ -1858,6 +2072,7 @@
+ float32 QEMU_FLATTEN
+ float32_mul(float32 a, float32 b, float_status *s)
+ {
++    FASTFP(true, ff32_mul(a, b, s));
+     return float32_gen2(a, b, s, hard_f32_mul, soft_f32_mul,
+                         f32_is_zon2, f32_addsubmul_post);
+ }
+@@ -1865,6 +2080,7 @@
+ float64 QEMU_FLATTEN
+ float64_mul(float64 a, float64 b, float_status *s)
+ {
++    FASTFP(true, ff64_mul(a, b, s));
+     return float64_gen2(a, b, s, hard_f64_mul, soft_f64_mul,
+                         f64_is_zon2, f64_addsubmul_post);
+ }
+@@ -1991,6 +2207,8 @@
+ {
+     union_float32 ua, ub, uc, ur;
+ 
++    FASTFP(ff_muladd_flags_ok(flags), ff32_muladd(xa, xb, xc, flags, s));
++
+     ua.s = xa;
+     ub.s = xb;
+     uc.s = xc;
+@@ -2062,6 +2280,8 @@
+ {
+     union_float64 ua, ub, uc, ur;
+ 
++    FASTFP(ff_muladd_flags_ok(flags), ff64_muladd(xa, xb, xc, flags, s));
++
+     ua.s = xa;
+     ub.s = xb;
+     uc.s = xc;
+@@ -2253,6 +2473,7 @@
+ float32 QEMU_FLATTEN
+ float32_div(float32 a, float32 b, float_status *s)
+ {
++    FASTFP(true, ff32_div(a, b, s));
+     return float32_gen2(a, b, s, hard_f32_div, soft_f32_div,
+                         f32_div_pre, f32_div_post);
+ }
+@@ -2260,6 +2481,7 @@
+ float64 QEMU_FLATTEN
+ float64_div(float64 a, float64 b, float_status *s)
+ {
++    FASTFP(true, ff64_div(a, b, s));
+     return float64_gen2(a, b, s, hard_f64_div, soft_f64_div,
+                         f64_div_pre, f64_div_post);
+ }
+@@ -3062,6 +3284,7 @@
+ 
+ int32_t float32_to_int32(float32 a, float_status *s)
+ {
++    FASTFP(true, ff32_to_i32_rne(a, s));
+     return float32_to_int32_scalbn(a, get_float_rounding_mode(s), 0, s);
+ }
+ 
+@@ -3132,6 +3355,7 @@
+ 
+ int32_t float32_to_int32_round_to_zero(float32 a, float_status *s)
+ {
++    FASTFP(true, ff32_to_i32_rtz(a, s));
+     return float32_to_int32_scalbn(a, float_round_to_zero, 0, s);
+ }
+ 
+@@ -3561,6 +3785,7 @@
+ 
+ uint32_t float32_to_uint32_round_to_zero(float32 a, float_status *s)
+ {
++    FASTFP(true, ff32_to_u32_rtz(a, s));
+     return float32_to_uint32_scalbn(a, float_round_to_zero, 0, s);
+ }
+ 
+@@ -3713,6 +3938,8 @@
+ 
+ float32 int32_to_float32(int32_t a, float_status *status)
+ {
++    float_status *s = status;
++    FASTFP(true, ff_i32_to_f32(a, s));
+     return int64_to_float32_scalbn(a, 0, status);
+ }
+ 
+@@ -3933,6 +4160,8 @@
+ 
+ float32 uint32_to_float32(uint32_t a, float_status *status)
+ {
++    float_status *s = status;
++    FASTFP(true, ff_u32_to_f32(a, s));
+     return uint64_to_float32_scalbn(a, 0, status);
+ }
+ 
+--- a/target/arm/tcg/vec_helper.c
++++ b/target/arm/tcg/vec_helper.c
+@@ -28,6 +28,81 @@
+ #include "vec_internal.h"
+ 
+ /*
++ * NOVA3 Android build: single-precision Neon on the host FPU.
++ *
++ * AArch32 Neon always computes under the "standard FPSCR": round to nearest,
++ * flush to zero, default NaN. AArch64 FPCR with FZ and DN set is exactly that
++ * mode, so with the host FPCR switched for the duration of a helper's loop
++ * each element is one host instruction instead of a softfloat call. Only the
++ * cumulative exception flags are not produced (games do not read them). Any
++ * other status (A64 Neon, VFP, QEMU_STRICT_FP=1) takes the softfloat loop.
++ */
++#if defined(__aarch64__)
++static int neon_fast_on = -1;
++
++static inline bool neon_fast(const float_status *s)
++{
++    if (unlikely(neon_fast_on < 0)) {
++        const char *v = getenv("QEMU_STRICT_FP");
++        neon_fast_on = !(v && *v && *v != '0');
++    }
++    return neon_fast_on &&
++           s->float_rounding_mode == float_round_nearest_even &&
++           s->flush_to_zero && s->flush_inputs_to_zero && s->default_nan_mode;
++}
++
++/*
++ * The standard mode is entered once and left in place: writing FPCR serialises the
++ * core, and a skinning loop issues one Neon helper call per instruction. Whatever next
++ * needs IEEE-default host arithmetic (softfloat's fast paths) restores it lazily
++ * through nova3_fpcr_default() (include/fpu/softfloat.h).
++ */
++static inline uint64_t fpcr_std_enter(void)
++{
++    if (!nova3_fpcr_std) {
++        uint64_t old, v;
++        asm volatile("mrs %0, fpcr" : "=r"(old) : : "memory");
++        nova3_fpcr_default_val = old;
++        v = (old & ~(3ull << 22)) | (1ull << 24) | (1ull << 25);  /* RN, FZ, DN */
++        asm volatile("msr fpcr, %0" : : "r"(v) : "memory");
++        nova3_fpcr_std = true;
++    }
++    return 0;
++}
++
++static inline void fpcr_leave(uint64_t old)
++{
++    (void)old;
++}
++
++static inline float f32h(float32 x) { float f; memcpy(&f, &x, 4); return f; }
++static inline float32 h32f(float f) { float32 x; memcpy(&x, &f, 4); return x; }
++
++/* Element-wise d = f(n, m) or d = f(d, n, m); ASM operands: r out, x n, y m, a old d. */
++#define FAST_3OP_S(NAME, ASM, SOFT)                                         \
++void HELPER(NAME)(void *vd, void *vn, void *vm,                             \
++                  float_status *stat, uint32_t desc)                        \
++{                                                                           \
++    intptr_t i, oprsz = simd_oprsz(desc);                                   \
++    float32 *d = vd, *n = vn, *m = vm;                                      \
++    if (neon_fast(stat)) {                                                  \
++        uint64_t o = fpcr_std_enter();                                      \
++        for (i = 0; i < oprsz / 4; i++) {                                   \
++            float x = f32h(n[i]), y = f32h(m[i]), a = f32h(d[i]), r;        \
++            asm(ASM : "=&w"(r) : "w"(x), "w"(y), "w"(a));                   \
++            d[i] = h32f(r);                                                 \
++        }                                                                   \
++        fpcr_leave(o);                                                      \
++    } else {                                                                \
++        for (i = 0; i < oprsz / 4; i++) {                                   \
++            d[i] = SOFT;                                                    \
++        }                                                                   \
++    }                                                                       \
++    clear_tail(d, oprsz, simd_maxsz(desc));                                 \
++}
++#endif
++
++/*
+  * Data for expanding active predicate bits to bytes, for byte elements.
+  *
+  *  for (i = 0; i < 256; ++i) {
+@@ -1458,19 +1533,31 @@
+ 
+ DO_3OP(gvec_fadd_b16, bfloat16_add, float16)
+ DO_3OP(gvec_fadd_h, float16_add, float16)
++#if defined(__aarch64__)
++FAST_3OP_S(gvec_fadd_s, "fadd %s0, %s1, %s2", float32_add(n[i], m[i], stat))
++#else
+ DO_3OP(gvec_fadd_s, float32_add, float32)
++#endif
+ DO_3OP(gvec_fadd_d, float64_add, float64)
+ DO_3OP(gvec_bfadd, bfloat16_add, bfloat16)
+ 
+ DO_3OP(gvec_fsub_b16, bfloat16_sub, float16)
+ DO_3OP(gvec_fsub_h, float16_sub, float16)
++#if defined(__aarch64__)
++FAST_3OP_S(gvec_fsub_s, "fsub %s0, %s1, %s2", float32_sub(n[i], m[i], stat))
++#else
+ DO_3OP(gvec_fsub_s, float32_sub, float32)
++#endif
+ DO_3OP(gvec_fsub_d, float64_sub, float64)
+ DO_3OP(gvec_bfsub, bfloat16_sub, bfloat16)
+ 
+ DO_3OP(gvec_fmul_b16, bfloat16_mul, float16)
+ DO_3OP(gvec_fmul_h, float16_mul, float16)
++#if defined(__aarch64__)
++FAST_3OP_S(gvec_fmul_s, "fmul %s0, %s1, %s2", float32_mul(n[i], m[i], stat))
++#else
+ DO_3OP(gvec_fmul_s, float32_mul, float32)
++#endif
+ DO_3OP(gvec_fmul_d, float64_mul, float64)
+ 
+ DO_3OP(gvec_ftsmul_h, float16_ftsmul, float16)
+@@ -1638,10 +1725,20 @@
+ }
+ 
+ DO_MULADD(gvec_fmla_nf_h, float16_muladd_nf, float16)
++#if defined(__aarch64__)
++FAST_3OP_S(gvec_fmla_nf_s, "fmul %s0, %s1, %s2\n\tfadd %s0, %s3, %s0",
++           float32_muladd_nf(d[i], n[i], m[i], stat))
++#else
+ DO_MULADD(gvec_fmla_nf_s, float32_muladd_nf, float32)
++#endif
+ 
+ DO_MULADD(gvec_fmls_nf_h, float16_mulsub_nf, float16)
++#if defined(__aarch64__)
++FAST_3OP_S(gvec_fmls_nf_s, "fmul %s0, %s1, %s2\n\tfsub %s0, %s3, %s0",
++           float32_mulsub_nf(d[i], n[i], m[i], stat))
++#else
+ DO_MULADD(gvec_fmls_nf_s, float32_mulsub_nf, float32)
++#endif
+ 
+ DO_MULADD(gvec_vfma_h, float16_muladd_f, float16)
+ DO_MULADD(gvec_vfma_s, float32_muladd_f, float32)
+@@ -1716,19 +1813,70 @@
+ 
+ DO_FMUL_IDX(gvec_fmul_idx_b16, nop, bfloat16_mul, float16, H2)
+ DO_FMUL_IDX(gvec_fmul_idx_h, nop, float16_mul, float16, H2)
+-DO_FMUL_IDX(gvec_fmul_idx_s, nop, float32_mul, float32, H4)
+ DO_FMUL_IDX(gvec_fmul_idx_d, nop, float64_mul, float64, H8)
+ 
+-#undef nop
+-
+ /*
+  * Non-fused multiply-accumulate operations, for Neon. NB that unlike
+  * the fused ops below they assume accumulate both from and into Vd.
+  */
+ DO_FMUL_IDX(gvec_fmla_nf_idx_h, float16_add, float16_mul, float16, H2)
+-DO_FMUL_IDX(gvec_fmla_nf_idx_s, float32_add, float32_mul, float32, H4)
+ DO_FMUL_IDX(gvec_fmls_nf_idx_h, float16_sub, float16_mul, float16, H2)
++
++/*
++ * NOVA3 Android build: single-precision Neon on the host FPU.
++ *
++ * AArch32 Neon always computes under the "standard FPSCR": round to nearest,
++ * flush to zero, default NaN. AArch64 FPCR with FZ and DN set is exactly that
++ * mode, so with the host FPCR switched for the duration of the loop each
++ * element is one host instruction instead of a softfloat call. Only the
++ * cumulative exception flags are not produced (games do not read them).
++ * Any other status (A64 Neon, QEMU_STRICT_FP=1) takes the softfloat loop.
++ */
++#if defined(__aarch64__)
++/* d op= n * m[idx] per 128-bit segment; OP is the asm body on r (out), x (n), y (scalar), a (old d). */
++#define FAST_IDX_S(NAME, ASM, SOFT)                                         \
++void HELPER(NAME)(void *vd, void *vn, void *vm,                             \
++                  float_status *stat, uint32_t desc)                        \
++{                                                                           \
++    intptr_t i, j, oprsz = simd_oprsz(desc);                                \
++    intptr_t segment = MIN(16, oprsz) / 4;                                  \
++    intptr_t idx = simd_data(desc);                                         \
++    float32 *d = vd, *n = vn, *m = vm;                                      \
++    if (neon_fast(stat)) {                                                  \
++        uint64_t o = fpcr_std_enter();                                      \
++        for (i = 0; i < oprsz / 4; i += segment) {                          \
++            float y = f32h(m[H4(i + idx)]);                                 \
++            for (j = 0; j < segment; j++) {                                 \
++                float x = f32h(n[i + j]), a = f32h(d[i + j]), r;            \
++                asm(ASM : "=&w"(r) : "w"(x), "w"(y), "w"(a));               \
++                d[i + j] = h32f(r);                                         \
++            }                                                               \
++        }                                                                   \
++        fpcr_leave(o);                                                      \
++    } else {                                                                \
++        for (i = 0; i < oprsz / 4; i += segment) {                          \
++            float32 mm = m[H4(i + idx)];                                    \
++            for (j = 0; j < segment; j++) {                                 \
++                d[i + j] = SOFT;                                            \
++            }                                                               \
++        }                                                                   \
++    }                                                                       \
++    clear_tail(d, oprsz, simd_maxsz(desc));                                 \
++}
++
++FAST_IDX_S(gvec_fmul_idx_s, "fmul %s0, %s1, %s2",
++           float32_mul(n[i + j], mm, stat))
++FAST_IDX_S(gvec_fmla_nf_idx_s, "fmul %s0, %s1, %s2\n\tfadd %s0, %s3, %s0",
++           float32_add(d[i + j], float32_mul(n[i + j], mm, stat), stat))
++FAST_IDX_S(gvec_fmls_nf_idx_s, "fmul %s0, %s1, %s2\n\tfsub %s0, %s3, %s0",
++           float32_sub(d[i + j], float32_mul(n[i + j], mm, stat), stat))
++#else
++DO_FMUL_IDX(gvec_fmul_idx_s, nop, float32_mul, float32, H4)
++DO_FMUL_IDX(gvec_fmla_nf_idx_s, float32_add, float32_mul, float32, H4)
+ DO_FMUL_IDX(gvec_fmls_nf_idx_s, float32_sub, float32_mul, float32, H4)
++#endif
++
++#undef nop
+ 
+ #define DO_FMLA_IDX(NAME, TYPE, H, NEGX, NEGF)                             \
+ void HELPER(NAME)(void *vd, void *vn, void *vm, void *va,                  \
+--- a/target/arm/tcg/op_helper.c
++++ b/target/arm/tcg/op_helper.c
+@@ -784,11 +784,72 @@
+     return cpsr_read(env) & ~CPSR_EXEC;
+ }
+ 
++/*
++ * NOVA3 Android build: the indirect-branch lookup for A32 user-mode code.
++ *
++ * Every return (bx lr, pop {pc}) and call through a pointer ends a TB in
++ * lookup_tb_ptr, and a C++ engine makes tens of millions of them a second.
++ * The generic helper calls get_tb_cpu_state through a function pointer and
++ * curr_cflags in another unit before it even looks at the jump cache; here
++ * the A32 flags are assembled inline and only a jump-cache miss (or anything
++ * unusual: AArch64, M-profile, single-step, breakpoints) takes the generic
++ * path, which also refills the cache.
++ */
++#if defined(CONFIG_USER_ONLY)
++#include "accel/tcg/tb-jmp-cache.h"
++#include "exec/translation-block.h"
++#include "exec/helper-proto-common.h"
++#endif
++
++const void *HELPER(arm_lookup_tb_ptr)(CPUARMState *env)
++{
++#if defined(CONFIG_USER_ONLY)
++    CPUState *cs = env_cpu(env);
++    CPUARMTBFlags flags = env->hflags;
++
++    if (likely(!EX_TBFLAG_ANY(flags, AARCH64_STATE) &&
++               !EX_TBFLAG_ANY(flags, SS_ACTIVE) &&
++               !arm_feature(env, ARM_FEATURE_M) &&
++               !cpu_single_stepping(cs) &&
++               QTAILQ_EMPTY(&cs->breakpoints))) {
++        vaddr pc = env->regs[15];
++        uint32_t cflags = cs->tcg_cflags;
++        CPUJumpCache *jc = cs->tb_jmp_cache;
++        unsigned h = (pc ^ (pc >> TB_JMP_CACHE_BITS)) & (TB_JMP_CACHE_SIZE - 1);
++        TranslationBlock *tb;
++
++        DP_TBFLAG_A32(flags, VECLEN, env->vfp.vec_len);
++        DP_TBFLAG_A32(flags, VECSTRIDE, env->vfp.vec_stride);
++        if (env->vfp.xregs[ARM_VFP_FPEXC] & (1 << 30)) {
++            DP_TBFLAG_A32(flags, VFPEN, 1);
++        }
++        DP_TBFLAG_AM32(flags, THUMB, env->thumb);
++        DP_TBFLAG_AM32(flags, CONDEXEC, env->condexec_bits);
++
++        tb = qatomic_read(&jc->array[h].tb);
++        if (likely(tb && jc->array[h].pc == pc &&
++                   tb->cs_base == flags.flags2 && tb->flags == flags.flags &&
++                   tb_cflags(tb) == cflags)) {
++            cs->neg.can_do_io = true;
++            return tb->tc.ptr;
++        }
++    }
++#endif
++    return helper_lookup_tb_ptr(env);
++}
++
+ void HELPER(cpsr_write)(CPUARMState *env, uint32_t val, uint32_t mask)
+ {
+     cpsr_write(env, val, mask, CPSRWriteByInstr);
+-    /* TODO: Not all cpsr bits are relevant to hflags.  */
+-    arm_rebuild_hflags(env);
++    /*
++     * TODO: Not all cpsr bits are relevant to hflags.
++     * NOVA3 Android build: the condition flags, Q and GE are not; guest code
++     * writes exactly those (MSR APSR_nzcvq/_g) often enough for the rebuild
++     * to show in profiles.
++     */
++    if (mask & ~(uint32_t)(CPSR_NZCV | CPSR_Q | CPSR_GE)) {
++        arm_rebuild_hflags(env);
++    }
+ }
+ 
+ /* Write the CPSR for a 32-bit exception return */
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -8856,8 +8856,15 @@
+         { NULL, NULL, NULL }
+     };
+ 
+-    /* if this is a file from /proc/ filesystem, expand full name */
+-    proc_name = realpath(fname, NULL);
++    /*
++     * if this is a file from /proc/ filesystem, expand full name
++     *
++     * NOVA3 Android build: only for names that mention "proc". glibc's
++     * realpath() checks "dir/.." components with faccessat(AT_EACCESS),
++     * i.e. the faccessat2 syscall, which Android's app seccomp filter kills
++     * the process for; and doing it on every guest open slows loading.
++     */
++    proc_name = strstr(fname, "proc") ? realpath(fname, NULL) : NULL;
+     if (proc_name && strncmp(proc_name, "/proc/", 6) == 0) {
+         pathname = proc_name;
+     } else {
+@@ -14699,6 +14706,64 @@
+     return filtered;
+ }
+ 
++/*
++ * NOVA3 Android build: QEMU_SYSCALL_STATS=1 prints, every 10 seconds, how many guest
++ * syscalls of each kind ran. Every guest syscall leaves translated code for the main
++ * loop, so a busy one is a cost of its own; this says which ones are worth a fast path.
++ */
++static int nova3_sc_stats = -1;
++static uint32_t nova3_sc_count[1024];
++static int64_t nova3_sc_t0;
++
++static void nova3_syscall_stats(int num, abi_long path_arg)
++{
++    if (nova3_sc_stats < 0) {
++        const char *v = getenv("QEMU_SYSCALL_STATS");
++        nova3_sc_stats = v && *v && *v != '0';
++        nova3_sc_t0 = g_get_monotonic_time();
++    }
++    if (!nova3_sc_stats) {
++        return;
++    }
++    qatomic_inc(&nova3_sc_count[num & 1023]);
++    /* A sample of the paths behind the busiest file syscalls. */
++    if (path_arg) {
++        static uint32_t seen;
++        if (qatomic_fetch_inc(&seen) % 500 == 0) {
++            char *p = lock_user_string(path_arg);
++            if (p) {
++                fprintf(stderr, "QEMU_SYSCALL_STATS: syscall %d path '%.200s'\n", num, p);
++                unlock_user(p, path_arg, 0);
++            }
++        }
++    }
++    int64_t now = g_get_monotonic_time();
++    if (now - nova3_sc_t0 < 10 * G_USEC_PER_SEC) {
++        return;
++    }
++    nova3_sc_t0 = now;
++    uint32_t total = 0;
++    for (int i = 0; i < 1024; i++) {
++        total += nova3_sc_count[i];
++    }
++    fprintf(stderr, "QEMU_SYSCALL_STATS: %u syscalls/10s, top:", total);
++    for (int k = 0; k < 10; k++) {
++        int best = -1;
++        for (int i = 0; i < 1024; i++) {
++            if (nova3_sc_count[i] && (best < 0 || nova3_sc_count[i] > nova3_sc_count[best])) {
++                best = i;
++            }
++        }
++        if (best < 0) {
++            break;
++        }
++        fprintf(stderr, " %d=%u", best, nova3_sc_count[best]);
++        nova3_sc_count[best] = 0;
++    }
++    memset(nova3_sc_count, 0, sizeof(nova3_sc_count));
++    fprintf(stderr, "\n");
++}
++
+ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
+                     abi_long arg2, abi_long arg3, abi_long arg4,
+                     abi_long arg5, abi_long arg6, abi_long arg7,
+@@ -14708,6 +14773,18 @@
+     TaskState *ts = get_task_state(cpu);
+     abi_long ret;
+ 
++    nova3_syscall_stats(num,
++#if defined(TARGET_NR_openat)
++                        num == TARGET_NR_openat ? arg2 :
++#endif
++#if defined(TARGET_NR_access)
++                        num == TARGET_NR_access ? arg1 :
++#endif
++#if defined(TARGET_NR_open)
++                        num == TARGET_NR_open ? arg1 :
++#endif
++                        0);
++
+ #ifdef DEBUG_ERESTARTSYS
+     /* Debug-only code for exercising the syscall-restart code paths
+      * in the per-architecture cpu main loops: restart every syscall
+--- a/accel/tcg/tb-jmp-cache.h
++++ b/accel/tcg/tb-jmp-cache.h
+@@ -12,7 +12,12 @@
+ #include "qemu/rcu.h"
+ #include "exec/cpu-common.h"
+ 
++/* NOVA3 Android build: a large guest (a C++ game engine) misses a 4096-entry cache often. */
++#ifdef NOVA3_JMP_BITS
++#define TB_JMP_CACHE_BITS NOVA3_JMP_BITS
++#else
+ #define TB_JMP_CACHE_BITS 12
++#endif
+ #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
+ 
+ /*
+--- a/tcg/tcg-op.c
++++ b/tcg/tcg-op.c
+@@ -2625,6 +2625,13 @@
+     tcg_gen_op1i(INDEX_op_goto_tb, 0, idx);
+ }
+ 
++/* NOVA3 Android build: jump to a host code pointer a target-specific lookup produced. */
++void tcg_gen_goto_ptr_val(TCGv_ptr ptr)
++{
++    plugin_gen_disable_mem_helpers();
++    tcg_gen_op1i(INDEX_op_goto_ptr, TCG_TYPE_PTR, tcgv_ptr_arg(ptr));
++}
++
+ void tcg_gen_lookup_and_goto_ptr(void)
+ {
+     TCGv_ptr ptr;
+--- a/include/tcg/tcg-op-common.h
++++ b/include/tcg/tcg-op-common.h
+@@ -84,6 +84,8 @@
+  * this op is equivalent to calling tcg_gen_exit_tb() with 0 as the argument.
+  */
+ void tcg_gen_lookup_and_goto_ptr(void);
++/* Jump to @ptr (a host code pointer, or the epilogue). The caller checks CF_NO_GOTO_PTR. */
++void tcg_gen_goto_ptr_val(TCGv_ptr ptr);
+ 
+ void tcg_gen_plugin_cb(unsigned from);
+ void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);
+--- a/target/arm/tcg/helper-defs.h
++++ b/target/arm/tcg/helper-defs.h
+@@ -64,6 +64,7 @@
+ DEF_HELPER_1(sev, void, env)
+ 
+ DEF_HELPER_3(cpsr_write, void, env, i32, i32)
++DEF_HELPER_FLAGS_1(arm_lookup_tb_ptr, TCG_CALL_NO_WG_SE, cptr, env)
+ DEF_HELPER_2(cpsr_write_eret, void, env, i32)
+ DEF_HELPER_1(cpsr_read, i32, env)
+ 
+--- a/target/arm/tcg/translate.c
++++ b/target/arm/tcg/translate.c
+@@ -1309,6 +1309,15 @@
+ 
+ static void gen_goto_ptr(void)
+ {
++#if defined(NOVA3_FAST_LOOKUP) && defined(CONFIG_USER_ONLY)
++    /* NOVA3 Android build: A32 lookup with the flags built inline (op_helper.c). */
++    if (!(tcg_ctx->gen_tb->cflags & CF_NO_GOTO_PTR)) {
++        TCGv_ptr ptr = tcg_temp_new_ptr();
++        gen_helper_arm_lookup_tb_ptr(ptr, tcg_env);
++        tcg_gen_goto_ptr_val(ptr);
++        return;
++    }
++#endif
+     tcg_gen_lookup_and_goto_ptr();
+ }
+ 
+--- a/include/fpu/softfloat.h
++++ b/include/fpu/softfloat.h
+@@ -1401,4 +1401,24 @@
+ #undef MINMAX_1
+ #undef MINMAX_2
+ 
++/*
++ * NOVA3 Android build: the host FPCR is left in the AArch32 "standard FPSCR" mode (FZ+DN)
++ * after a Neon helper (target/arm/tcg/vec_helper.c) instead of being switched back on every
++ * call; anything that computes with the host FPU in IEEE-default mode calls this first.
++ */
++#if defined(__aarch64__)
++extern __thread bool nova3_fpcr_std;
++extern __thread uint64_t nova3_fpcr_default_val;
++
++static inline void nova3_fpcr_default(void)
++{
++    if (__builtin_expect(nova3_fpcr_std, 0)) {
++        __asm__ volatile("msr fpcr, %0" : : "r"(nova3_fpcr_default_val) : "memory");
++        nova3_fpcr_std = false;
++    }
++}
++#else
++static inline void nova3_fpcr_default(void) { }
++#endif
++
+ #endif /* SOFTFLOAT_H */

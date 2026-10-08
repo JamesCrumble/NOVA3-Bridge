@@ -1,0 +1,42 @@
+{
+  "version": 4,
+  "name": "nova3-native-arm.zip",
+  "items": [
+    "N.O.V.A. 3.sh",
+    "nova3"
+  ],
+  "items_opt": [],
+  "attr": {
+    "title": "N.O.V.A. 3: Near Orbit Vanguard Alliance",
+    "porter": [
+      "EapRules"
+    ],
+    "desc": "The 2012 N.O.V.A. 3: Near Orbit Vanguard Alliance mobile science-fiction first-person shooter by Gameloft, running its original Android ARM library directly on Linux through a bionic/JNI compatibility loader.",
+    "desc_md": null,
+    "inst": "Supply your own N.O.V.A. 3 v1.0.7 APK plus its two OBB expansion files (main.1050 and patch.1070). Put them in ports/nova3/; the donor filenames do not matter and the first launch extracts and validates them automatically. An extracted Android/obb backup folder works too. Keep the port release named nova3-native-arm.zip. Wait for PortMaster's Finished running autoinstall dialog, then reboot normally before looking for the game in Ports. The first launch after the import unpacks the levels it needs out of the expansion containers, so it takes noticeably longer than later ones. The supported native-library SHA1 is ae97a4423fc6b9d003cc534fd4a4d03e6d0df0c0. No game data is included.",
+    "inst_md": null,
+    "genres": [
+      "action",
+      "shooter"
+    ],
+    "image": {},
+    "rtr": false,
+    "exp": false,
+    "runtime": null,
+    "reqs": [
+      "analog_2"
+    ],
+    "arch": [
+      "armhf"
+    ],
+    "min_glibc": "2.29",
+    "status": {
+      "source": "https://github.com/EapRules/nova3-native-arm",
+      "date_added": "2026-08-10"
+    },
+    "publisher": "Gameloft",
+    "developer": "Gameloft",
+    "released": "2012-05-03",
+    "players": "1"
+  }
+}

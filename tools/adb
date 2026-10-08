@@ -1,0 +1,3 @@
+#!/bin/sh
+# Windows adb.exe (sees the phone over Windows USB), called from WSL.
+exec "$(dirname "$0")/../android-sdk/platform-tools/adb.exe" "$@"

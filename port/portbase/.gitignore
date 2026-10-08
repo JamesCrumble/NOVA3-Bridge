@@ -1,0 +1,6 @@
+build/
+*.core
+emulator/runtime*/
+__pycache__/
+.DS_Store
+._*

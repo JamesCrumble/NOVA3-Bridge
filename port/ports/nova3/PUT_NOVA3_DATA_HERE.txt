@@ -1,0 +1,28 @@
+Put your own N.O.V.A. 3: Near Orbit Vanguard Alliance v1.0.7 APK plus its two
+OBB expansion files in this directory. The filenames do not matter.
+
+N.O.V.A. 3 PortMaster port and eapx extractor by EapRules.
+
+The port validates this exact native library before extracting anything:
+
+  lib/armeabi-v7a/libNOVA3_neon.so
+  SHA1 ae97a4423fc6b9d003cc534fd4a4d03e6d0df0c0
+
+(the APK also carries libNOVA3_8_neon.so, an older build; the port ignores it.)
+
+A complete donor is three files:
+
+  the APK           (game code, ~34 MB)
+  main.1050.com.gameloft.android.ANMP.GloftN3HM.obb    (~1.85 GB)
+  patch.1070.com.gameloft.android.ANMP.GloftN3HM.obb   (~325 MB)
+
+The supported build is v1.0.7, Android package
+com.gameloft.android.ANMP.GloftN3HM. Any of these three shapes works - drop
+whichever one your copy came as, next to the APK:
+
+  the two .obb files loose in this directory
+  an Android/obb backup zip, unpacked or still zipped
+  that backup's extracted com.gameloft.android.ANMP.GloftN3HM folder
+
+The first launch extracts and validates everything automatically, then starts
+the game. No game data is ever distributed with this port.

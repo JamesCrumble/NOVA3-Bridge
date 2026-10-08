@@ -1,0 +1,11 @@
+build/
+harness/results/
+qemu_*.core
+# Game data is the player's, never the repo's.
+game/libNOVA3_neon.so
+game/*.obb
+gamebin/
+# Android wrapper output (APK, signing key, sysroot, staging).
+NOVA3-ARM32-debug.apk*
+android/build/
+__pycache__/

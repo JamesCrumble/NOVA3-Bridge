@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<gameList>
+	<game>
+		<path>./N.O.V.A. 3.sh</path>
+		<name>N.O.V.A. 3: Near Orbit Vanguard Alliance</name>
+		<desc>The 2012 mobile science-fiction first-person shooter by Gameloft. Port by EapRules. It runs the original Android ARM library directly through a bionic/JNI compatibility loader. Supply your own v1.0.7 APK plus both OBB expansion files; the first launch imports them automatically.</desc>
+		<releasedate>20120503T000000</releasedate>
+		<developer>Gameloft</developer>
+		<publisher>Gameloft</publisher>
+		<genre>Action / Shooter</genre>
+		<players>1</players>
+		<image>./nova3/cover.png</image>
+	</game>
+</gameList>

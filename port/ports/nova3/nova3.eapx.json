@@ -1,0 +1,384 @@
+{
+  "schema": 1,
+  "id": "nova3-1.0.7",
+  "version": "1",
+  "title": "N.O.V.A. 3: Near Orbit Vanguard Alliance",
+  "abi_order": [
+    "armeabi-v7a"
+  ],
+  "input": {
+    "search_dirs": [
+      "gamedata",
+      "."
+    ]
+  },
+  "extract": [
+    {
+      "id": "native-library",
+      "description": "N.O.V.A. 3 v1.0.7 native library",
+      "destination": "lib/armeabi-v7a/libNOVA3_neon.so",
+      "source": {
+        "kind": "entry",
+        "patterns": [
+          "lib/armeabi-v7a/libNOVA3_neon.so",
+          "*/lib/armeabi-v7a/libNOVA3_neon.so",
+          "libNOVA3_neon.so"
+        ]
+      },
+      "validate": {
+        "size": 18626086,
+        "sha256": [
+          "f8ebfb93620b7226fe9565395f47d260d0016022f69fb47920ee6079aa9f9ac9"
+        ],
+        "critical_regions": {
+          "regions": [
+            {
+              "offset": "0xd43e8",
+              "size": 64
+            },
+            {
+              "offset": "0x8d31c0",
+              "size": 64
+            },
+            {
+              "offset": "0x8d3254",
+              "size": 24
+            },
+            {
+              "offset": "0x8cd0f0",
+              "size": 4
+            },
+            {
+              "offset": "0x8d036c",
+              "size": 12
+            },
+            {
+              "offset": "0x8d0654",
+              "size": 4
+            },
+            {
+              "offset": "0x8d071c",
+              "size": 64
+            },
+            {
+              "offset": "0x8d4258",
+              "size": 64
+            },
+            {
+              "offset": "0x8d1934",
+              "size": 8
+            },
+            {
+              "offset": "0x8d210c",
+              "size": 8
+            },
+            {
+              "offset": "0x8cd2f0",
+              "size": 24
+            },
+            {
+              "offset": "0x8cd11c",
+              "size": 12
+            },
+            {
+              "offset": "0x8cd3fc",
+              "size": 16
+            },
+            {
+              "offset": "0x8cd360",
+              "size": 24
+            }
+          ],
+          "sha256": "d36d136d9b3108772cd514505822a9c615d91637684b30dea05ea80934e0b69c"
+        },
+        "elf_machine": "armeabi-v7a"
+      }
+    },
+    {
+      "id": "main-obb",
+      "description": "main expansion container (Gameloft archive, served as-is)",
+      "destination": "com.gameloft.android.ANMP.GloftN3HM/main.1050.com.gameloft.android.ANMP.GloftN3HM.obb",
+      "source": {
+        "kind": "blob",
+        "patterns": [
+          "main.1050.com.gameloft.android.ANMP.GloftN3HM.obb",
+          "main.1050.*.obb",
+          "obb/com.gameloft.android.ANMP.GloftN3HM/main.1050.*.obb",
+          "Android/obb/com.gameloft.android.ANMP.GloftN3HM/main.1050.*.obb",
+          "com.gameloft.android.ANMP.GloftN3HM/main.1050.*.obb"
+        ]
+      },
+      "validate": {
+        "size": 1980258754,
+        "sha256": [
+          "0e5d025cbe1a4c51d6071993cf402166191bf69901a0e0d9896235aeda2b2c14"
+        ],
+        "critical_regions": {
+          "regions": [
+            {
+              "offset": "0x0",
+              "size": 65536
+            },
+            {
+              "offset": "0x10dc7a89",
+              "size": 65536
+            },
+            {
+              "offset": "0x21b8f512",
+              "size": 65536
+            },
+            {
+              "offset": "0x32956f9c",
+              "size": 65536
+            },
+            {
+              "offset": "0x4371ea25",
+              "size": 65536
+            },
+            {
+              "offset": "0x544e64af",
+              "size": 65536
+            },
+            {
+              "offset": "0x652adf38",
+              "size": 65536
+            },
+            {
+              "offset": "0x760759c2",
+              "size": 65536
+            }
+          ],
+          "sha256": "72349873d4d2ce9cb40065645229fed435ed08967b10d31c65657d9c98283e7d"
+        }
+      }
+    },
+    {
+      "id": "patch-obb",
+      "description": "patch expansion container (Gameloft archive, served as-is)",
+      "destination": "com.gameloft.android.ANMP.GloftN3HM/patch.1070.com.gameloft.android.ANMP.GloftN3HM.obb",
+      "source": {
+        "kind": "blob",
+        "patterns": [
+          "patch.1070.com.gameloft.android.ANMP.GloftN3HM.obb",
+          "patch.1070.*.obb",
+          "obb/com.gameloft.android.ANMP.GloftN3HM/patch.1070.*.obb",
+          "Android/obb/com.gameloft.android.ANMP.GloftN3HM/patch.1070.*.obb",
+          "com.gameloft.android.ANMP.GloftN3HM/patch.1070.*.obb"
+        ]
+      },
+      "validate": {
+        "size": 339002046,
+        "sha256": [
+          "3b1806a3180070f76695be3fe052b40429ab6dc8c9d33fd9c4baf6db2219e738"
+        ],
+        "critical_regions": {
+          "regions": [
+            {
+              "offset": "0x0",
+              "size": 65536
+            },
+            {
+              "offset": "0x2e2d2ad",
+              "size": 65536
+            },
+            {
+              "offset": "0x5c5a55a",
+              "size": 65536
+            },
+            {
+              "offset": "0x8a87808",
+              "size": 65536
+            },
+            {
+              "offset": "0xb8b4ab5",
+              "size": 65536
+            },
+            {
+              "offset": "0xe6e1d63",
+              "size": 65536
+            },
+            {
+              "offset": "0x1150f010",
+              "size": 65536
+            },
+            {
+              "offset": "0x1433c2be",
+              "size": 65536
+            }
+          ],
+          "sha256": "1dc236a282e36c900039f7c1610c7d9cde3432295db3f8dfcf8f4597bfb31cf9"
+        }
+      }
+    }
+  ],
+  "validate": [
+    {
+      "size": 18626086,
+      "sha256": [
+        "f8ebfb93620b7226fe9565395f47d260d0016022f69fb47920ee6079aa9f9ac9"
+      ],
+      "critical_regions": {
+        "regions": [
+          {
+            "offset": "0xd43e8",
+            "size": 64
+          },
+          {
+            "offset": "0x8d31c0",
+            "size": 64
+          },
+          {
+            "offset": "0x8d3254",
+            "size": 24
+          },
+          {
+            "offset": "0x8cd0f0",
+            "size": 4
+          },
+          {
+            "offset": "0x8d036c",
+            "size": 12
+          },
+          {
+            "offset": "0x8d0654",
+            "size": 4
+          },
+          {
+            "offset": "0x8d071c",
+            "size": 64
+          },
+          {
+            "offset": "0x8d4258",
+            "size": 64
+          },
+          {
+            "offset": "0x8d1934",
+            "size": 8
+          },
+          {
+            "offset": "0x8d210c",
+            "size": 8
+          },
+          {
+            "offset": "0x8cd2f0",
+            "size": 24
+          },
+          {
+            "offset": "0x8cd11c",
+            "size": 12
+          },
+          {
+            "offset": "0x8cd3fc",
+            "size": 16
+          },
+          {
+            "offset": "0x8cd360",
+            "size": 24
+          }
+        ],
+        "sha256": "d36d136d9b3108772cd514505822a9c615d91637684b30dea05ea80934e0b69c"
+      },
+      "elf_machine": "armeabi-v7a",
+      "path": "lib/armeabi-v7a/libNOVA3_neon.so"
+    },
+    {
+      "size": 1980258754,
+      "sha256": [
+        "0e5d025cbe1a4c51d6071993cf402166191bf69901a0e0d9896235aeda2b2c14"
+      ],
+      "critical_regions": {
+        "regions": [
+          {
+            "offset": "0x0",
+            "size": 65536
+          },
+          {
+            "offset": "0x10dc7a89",
+            "size": 65536
+          },
+          {
+            "offset": "0x21b8f512",
+            "size": 65536
+          },
+          {
+            "offset": "0x32956f9c",
+            "size": 65536
+          },
+          {
+            "offset": "0x4371ea25",
+            "size": 65536
+          },
+          {
+            "offset": "0x544e64af",
+            "size": 65536
+          },
+          {
+            "offset": "0x652adf38",
+            "size": 65536
+          },
+          {
+            "offset": "0x760759c2",
+            "size": 65536
+          }
+        ],
+        "sha256": "72349873d4d2ce9cb40065645229fed435ed08967b10d31c65657d9c98283e7d"
+      },
+      "path": "com.gameloft.android.ANMP.GloftN3HM/main.1050.com.gameloft.android.ANMP.GloftN3HM.obb"
+    },
+    {
+      "size": 339002046,
+      "sha256": [
+        "3b1806a3180070f76695be3fe052b40429ab6dc8c9d33fd9c4baf6db2219e738"
+      ],
+      "critical_regions": {
+        "regions": [
+          {
+            "offset": "0x0",
+            "size": 65536
+          },
+          {
+            "offset": "0x2e2d2ad",
+            "size": 65536
+          },
+          {
+            "offset": "0x5c5a55a",
+            "size": 65536
+          },
+          {
+            "offset": "0x8a87808",
+            "size": 65536
+          },
+          {
+            "offset": "0xb8b4ab5",
+            "size": 65536
+          },
+          {
+            "offset": "0xe6e1d63",
+            "size": 65536
+          },
+          {
+            "offset": "0x1150f010",
+            "size": 65536
+          },
+          {
+            "offset": "0x1433c2be",
+            "size": 65536
+          }
+        ],
+        "sha256": "1dc236a282e36c900039f7c1610c7d9cde3432295db3f8dfcf8f4597bfb31cf9"
+      },
+      "path": "com.gameloft.android.ANMP.GloftN3HM/patch.1070.com.gameloft.android.ANMP.GloftN3HM.obb"
+    }
+  ],
+  "commit": [
+    "lib",
+    "com.gameloft.android.ANMP.GloftN3HM"
+  ],
+  "marker": ".eapx-nova3-data.json",
+  "log": "eapx.log",
+  "placeholder": "PUT_NOVA3_DATA_HERE.txt",
+  "space": {
+    "safety_bytes": 67108864
+  },
+  "requires_eapx": ">=0.4.4"
+}

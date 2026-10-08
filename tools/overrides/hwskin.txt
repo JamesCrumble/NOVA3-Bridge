@@ -1,0 +1,2 @@
+# Skinning in the vertex shader instead of NEON on the CPU (the engine's HardwareSkinning option, absent from every profile).
+<attributes>=><attributes><bool name="HardwareSkinning" value="true"/>
