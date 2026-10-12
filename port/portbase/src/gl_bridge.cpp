@@ -27,6 +27,7 @@
  */
 #define PORT_GL_NO_REDIRECT
 #include "gl_bridge.h"
+#include "frame_stats.h"
 
 #include <SDL2/SDL.h>
 
@@ -197,6 +198,9 @@ static void msg_end(size_t payload)
         out_raw(zeros, pad);
 }
 
+PortFrameStats g_port_frame;
+static void count_payload(int op, size_t dlen);   /* below, once the op numbers are known */
+
 static void send_msg(int op, const void *hdr, size_t hlen, const void *data, size_t dlen)
 {
     /* The common case - a few words of arguments and no data - written as
@@ -213,6 +217,8 @@ static void send_msg(int op, const void *hdr, size_t hlen, const void *data, siz
         g_out_len += 8 + hlen;
         return;
     }
+    if (dlen)
+        count_payload(op, dlen);
     size_t payload = hlen + dlen;
     msg_begin(op, payload);
     if (hlen)
@@ -285,6 +291,19 @@ static int32_t query_int(int op, std::initializer_list<int32_t> args, const void
 }
 
 #include "gl_bridge_gen.inc"
+
+static void count_payload(int op, size_t dlen)
+{
+    if (op == GB_OP_BUFFER_DATA || op == GB_OP_BUFFER_SUB_DATA) {
+        g_port_frame.buf_bytes += dlen;
+    } else if (op == GB_OP_SHADER_SOURCE) {
+        g_port_frame.shaders++;
+    } else if (op != GB_OP_UNIFORM_V && dlen >= 1024) {
+        /* What is left with a payload of any size is texture data. */
+        g_port_frame.textures++;
+        g_port_frame.tex_bytes += dlen;
+    }
+}
 
 /* ------------------------------------------------------------ local state */
 
@@ -472,6 +491,7 @@ static void gb_glLinkProgram(GLuint program)
     /* Linking resets the program's uniforms; forget what they held. */
     if (program < g_uni.size())
         g_uni[program].clear();
+    g_port_frame.links++;
     gb_raw_glLinkProgram(program);
     program_info_fetch(program);
 }
@@ -590,6 +610,8 @@ static void gb_glBindBuffer(GLenum target, GLuint buffer)
  * the indices say which those are; the host's copy cannot be read back
  * cheaply, so the guest keeps its own.
  */
+static uint32_t g_elem_gen = 1;   /* bumped by every write to an index buffer, see shadow_range() */
+
 static std::vector<uint8_t> *elem_shadow(GLuint id)
 {
     if (id == 0)
@@ -606,6 +628,7 @@ static void shadow_write(GLenum target, size_t offset, const void *data, size_t 
     std::vector<uint8_t> *s = elem_shadow(g_elem_buf);
     if (!s)
         return;
+    g_elem_gen++;
     if (whole)
         s->assign(size, 0);
     if (offset + size > s->size())
@@ -878,9 +901,20 @@ static void gb_glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLbo
                                          (int32_t)(uintptr_t)pointer });
 }
 
+/*
+ * One upload: a run of client memory and every enabled attribute that reads from it.
+ *
+ * The engine keeps its CPU-skinned vertices interleaved (position, normal, tangent, UV in one array
+ * with a common stride), and a block per attribute sent that whole array once for each of them -
+ * megabytes a frame through the pipe, which is where the main thread was found waiting in the
+ * heavy scenes. Attributes that share a stride and start within one stride of each other are
+ * therefore one block.
+ */
 struct Block {
-    int idx;
-    const Attrib *a;
+    const uint8_t *base;    /* lowest attribute pointer, vertex 0 */
+    size_t stride, span;    /* span: bytes of one vertex that the attributes cover */
+    int n;
+    int idx[kMaxAttribs];
     const uint8_t *data;
     size_t len;
 };
@@ -894,26 +928,58 @@ static void collect_client(GLint v0, GLsizei vcount, std::vector<Block> &out)
             continue;
         size_t elem = (size_t)a.size * (size_t)type_size(a.type);
         size_t stride = a.stride ? (size_t)a.stride : elem;
-        Block b;
-        b.idx = i;
-        b.a = &a;
-        b.data = (const uint8_t *)a.ptr + (size_t)v0 * stride;
-        b.len = (size_t)(vcount - 1) * stride + elem;
-        out.push_back(b);
+        const uint8_t *p = (const uint8_t *)a.ptr;
+        Block *b = NULL;
+        for (size_t k = 0; k < out.size() && !b; k++) {
+            Block &c = out[k];
+            if (c.stride != stride)
+                continue;
+            const uint8_t *lo = p < c.base ? p : c.base;
+            const uint8_t *hi = p + elem > c.base + c.span ? p + elem : c.base + c.span;
+            if ((size_t)(hi - lo) <= stride) {
+                c.base = lo;
+                c.span = (size_t)(hi - lo);
+                b = &c;
+            }
+        }
+        if (!b) {
+            out.emplace_back();
+            b = &out.back();
+            b->base = p;
+            b->stride = stride;
+            b->span = elem;
+            b->n = 0;
+        }
+        b->idx[b->n++] = i;
+    }
+    for (size_t k = 0; k < out.size(); k++) {
+        Block &b = out[k];
+        b.data = b.base + (size_t)v0 * b.stride;
+        b.len = (size_t)(vcount - 1) * b.stride + b.span;
     }
 }
 
 static inline size_t pad4(size_t n) { return (n + 3) & ~(size_t)3; }
 
+/* Per block: {attributes, stride, bytes}, then {index, size, type, normalized, offset} per attribute, then the data. */
 static void write_blocks(const std::vector<Block> &blocks)
 {
     for (size_t i = 0; i < blocks.size(); i++) {
         const Block &b = blocks[i];
-        int32_t h[6] = { b.idx, b.a->size, (int32_t)b.a->type, (int32_t)b.a->normalized, b.a->stride,
-                         (int32_t)b.len };
-        out_raw(h, sizeof(h));
+        int32_t h[3 + 5 * kMaxAttribs] = { b.n, (int32_t)b.stride, (int32_t)b.len };
+        for (int k = 0; k < b.n; k++) {
+            const Attrib &a = g_attr[b.idx[k]];
+            int32_t *w = h + 3 + 5 * k;
+            w[0] = b.idx[k];
+            w[1] = a.size;
+            w[2] = (int32_t)a.type;
+            w[3] = (int32_t)a.normalized;
+            w[4] = (int32_t)((const uint8_t *)a.ptr - b.base);
+        }
+        out_raw(h, (size_t)(3 + 5 * b.n) * 4);
         out_raw(b.data, b.len);
         msg_end(b.len);
+        g_port_frame.vtx_bytes += b.len;
     }
 }
 
@@ -921,7 +987,7 @@ static size_t blocks_bytes(const std::vector<Block> &blocks)
 {
     size_t n = 0;
     for (size_t i = 0; i < blocks.size(); i++)
-        n += 24 + pad4(blocks[i].len);
+        n += 12 + 20 * (size_t)blocks[i].n + pad4(blocks[i].len);
     return n;
 }
 
@@ -939,20 +1005,46 @@ static void gb_glDrawArrays(GLenum mode, GLint first, GLsizei count)
     write_blocks(blocks);
 }
 
-static uint32_t max_index_of(const void *indices, GLsizei count, GLenum type)
+/* The vertices an indexed draw reaches: [lo, hi]. */
+static void index_range(const void *indices, GLsizei count, GLenum type, uint32_t &lo, uint32_t &hi)
 {
-    uint32_t m = 0;
+    uint32_t m = 0, n = 0xFFFFFFFFu;
     if (type == 0x1401) {
         const uint8_t *p = (const uint8_t *)indices;
-        for (GLsizei i = 0; i < count; i++) if (p[i] > m) m = p[i];
+        for (GLsizei i = 0; i < count; i++) { if (p[i] > m) m = p[i]; if (p[i] < n) n = p[i]; }
     } else if (type == 0x1403) {
         const uint16_t *p = (const uint16_t *)indices;
-        for (GLsizei i = 0; i < count; i++) if (p[i] > m) m = p[i];
+        for (GLsizei i = 0; i < count; i++) { if (p[i] > m) m = p[i]; if (p[i] < n) n = p[i]; }
     } else {
         const uint32_t *p = (const uint32_t *)indices;
-        for (GLsizei i = 0; i < count; i++) if (p[i] > m) m = p[i];
+        for (GLsizei i = 0; i < count; i++) { if (p[i] > m) m = p[i]; if (p[i] < n) n = p[i]; }
     }
-    return m;
+    lo = n;
+    hi = m;
+}
+
+/*
+ * The same answer for indices that live in a buffer, remembered: a mesh is drawn with the same
+ * slice of the same index buffer every frame, and walking it again each time is emulated work.
+ * Any write to any index buffer forgets everything.
+ */
+struct RangeMemo {
+    uint32_t buf, off, count, type, gen, lo, hi;
+};
+static RangeMemo g_range_memo[512];
+
+static void shadow_range(GLuint buf, const std::vector<uint8_t> &s, size_t off, GLsizei count, GLenum type,
+                         uint32_t &lo, uint32_t &hi)
+{
+    RangeMemo &m = g_range_memo[(buf * 31u + (uint32_t)off * 7u + (uint32_t)count) & 511u];
+    if (m.gen == g_elem_gen && m.buf == buf && m.off == (uint32_t)off && m.count == (uint32_t)count &&
+        m.type == type) {
+        lo = m.lo;
+        hi = m.hi;
+        return;
+    }
+    index_range(s.data() + off, count, type, lo, hi);
+    m = { buf, (uint32_t)off, (uint32_t)count, (uint32_t)type, g_elem_gen, lo, hi };
 }
 
 static void gb_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices)
@@ -963,24 +1055,32 @@ static void gb_glDrawElements(GLenum mode, GLsizei count, GLenum type, const voi
     std::vector<Block> blocks;
     const bool client_indices = g_elem_buf == 0;
     size_t idx_bytes = 0;
+    uint32_t lo = 0, hi = 0;
 
     if (client_indices) {
         if (!indices)
             return;
         idx_bytes = (size_t)count * (size_t)type_size(type);
-        collect_client(0, (GLsizei)max_index_of(indices, count, type) + 1, blocks);
+        bool any_client = false;
+        for (int i = 0; i < kMaxAttribs; i++)
+            any_client |= g_attr[i].enabled && g_attr[i].client && g_attr[i].ptr;
+        if (any_client) {
+            index_range(indices, count, type, lo, hi);
+            collect_client((GLint)lo, (GLsizei)(hi - lo) + 1, blocks);
+        }
     } else {
         bool any_client = false;
         for (int i = 0; i < kMaxAttribs; i++)
             any_client |= g_attr[i].enabled && g_attr[i].client && g_attr[i].ptr;
         if (any_client) {
             /* Indices in a buffer, vertices in client memory: the shadow copy
-             * says how many vertices the draw reaches. */
+             * says which vertices the draw reaches. */
             std::vector<uint8_t> *s = elem_shadow(g_elem_buf);
             size_t off = (size_t)(uintptr_t)indices;
             size_t need = off + (size_t)count * (size_t)type_size(type);
             if (s && need <= s->size()) {
-                collect_client(0, (GLsizei)max_index_of(s->data() + off, count, type) + 1, blocks);
+                shadow_range(g_elem_buf, *s, off, count, type, lo, hi);
+                collect_client((GLint)lo, (GLsizei)(hi - lo) + 1, blocks);
             } else {
                 static bool warned = false;
                 if (!warned) {
@@ -992,10 +1092,13 @@ static void gb_glDrawElements(GLenum mode, GLsizei count, GLenum type, const voi
         }
     }
 
-    size_t payload = 24 + blocks_bytes(blocks) + (client_indices ? pad4(idx_bytes) : 0);
+    /* Only vertices [lo, hi] travel; the host leaves room for the ones before them, so the indices
+     * still mean what they meant. */
+    size_t payload = 28 + blocks_bytes(blocks) + (client_indices ? pad4(idx_bytes) : 0);
     msg_begin(GB_OP_DRAW_ELEMENTS, payload);
-    int32_t h[6] = { (int32_t)mode, count, (int32_t)type, client_indices ? 1 : 0,
-                     client_indices ? (int32_t)idx_bytes : (int32_t)(uintptr_t)indices, (int32_t)blocks.size() };
+    int32_t h[7] = { (int32_t)mode, count, (int32_t)type, client_indices ? 1 : 0,
+                     client_indices ? (int32_t)idx_bytes : (int32_t)(uintptr_t)indices, (int32_t)blocks.size(),
+                     blocks.empty() ? 0 : (int32_t)lo };
     out_raw(h, sizeof(h));
     write_blocks(blocks);
     if (client_indices) {
@@ -1396,17 +1499,53 @@ extern "C" int gl_bridge_init(void)
 static uint64_t g_step_ns, g_swap_ns, g_frame_t0;
 static long     g_prof_frames;
 
+/*
+ * A frame that took much longer than the ones around it gets a line of its own, with what the port
+ * saw pass through during it: "it stutters when something spawns" is otherwise invisible in
+ * ten-second averages. <PREFIX>_SLOW_FRAME_MS (50) is the floor; 0 turns it off.
+ */
+static void slow_frame(uint64_t step_ns)
+{
+    static long   floor_ms = -1, frames, printed;
+    static double usual_ms;
+    static uint64_t window_t0;
+
+    if (floor_ms < 0)
+        floor_ms = port_getenv_long("SLOW_FRAME_MS", 50);
+    double ms = step_ns / 1e6;
+    frames++;
+    if (floor_ms > 0 && frames > 300 && ms >= (double)floor_ms && ms > usual_ms * 1.7) {
+        uint64_t now = now_ns();
+        if (now - window_t0 > 10000000000ull) {
+            window_t0 = now;
+            printed = 0;
+        }
+        if (printed++ < 30) {
+            const PortFrameStats &f = g_port_frame;
+            trace("slow frame %ld: step %.0f ms (usual %.0f) | opens %u%s%s | textures %u (%lu KB) | "
+                  "buffers %lu KB | vertices %lu KB | shaders %u, links %u | touches %u",
+                  frames, ms, usual_ms, f.opens, f.opens ? ", last " : "", f.last_open, f.textures,
+                  f.tex_bytes / 1024, f.buf_bytes / 1024, f.vtx_bytes / 1024, f.shaders, f.links, f.touches);
+        }
+    }
+    /* The usual frame: follows ordinary frames quickly and a spike hardly at all. */
+    usual_ms += ((ms > usual_ms * 1.7 && usual_ms > 0 ? usual_ms * 1.05 : ms) - usual_ms) * 0.1;
+}
+
 extern "C" void gl_bridge_profile_step(int begin)
 {
     if (g_profile < 0)
         g_profile = port_getenv_long("GL_PROFILE", 0) ? 1 : 0;
-    if (g_profile <= 0)
-        return;
     if (begin) {
+        memset(&g_port_frame, 0, sizeof(g_port_frame));
         g_frame_t0 = now_ns();
         return;
     }
-    g_step_ns += now_ns() - g_frame_t0;
+    uint64_t step = now_ns() - g_frame_t0;
+    slow_frame(step);
+    if (g_profile <= 0)
+        return;
+    g_step_ns += step;
     if (++g_prof_frames % 120 == 0) {
         double n = 120.0;
         trace("glprof: step %.1f ms (bridge %.1f ms, %.0f calls), swap wait %.1f ms per frame",

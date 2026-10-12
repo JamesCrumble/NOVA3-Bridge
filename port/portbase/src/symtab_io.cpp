@@ -1,4 +1,5 @@
 #include "port_env.h"
+#include "frame_stats.h"
 #include "io_paths.h"
 /*
  * Path-translating wrappers around the libc entry points the game opens files
@@ -368,6 +369,11 @@ static void trace_path(const char *what, const char *orig, const char *fixed, in
  */
 static void count_asset_open(const char *fixed, bool succeeded)
 {
+    if (fixed) {
+        const char *base = strrchr(fixed, '/');
+        g_port_frame.opens++;
+        snprintf(g_port_frame.last_open, sizeof(g_port_frame.last_open), "%s", base ? base + 1 : fixed);
+    }
     if (succeeded && fixed && strstr(fixed, "/assets/published/"))
         g_assets_opened.fetch_add(1, std::memory_order_relaxed);
 }

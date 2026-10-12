@@ -280,6 +280,9 @@ final class GameProcess {
         env.put("SDL_VIDEODRIVER", "offscreen");
         env.put("SDL_AUDIODRIVER", "disk");
         env.put("SDL_DISKAUDIOFILE", fifo.getPath());
+        // The port's OpenSL ES writes the game's mixer blocks straight into the FIFO (see audioLoop());
+        // SDL's disk device above is only its fallback.
+        env.put("NOVA3_AUDIO_FIFO", fifo.getPath());
         env.put("NOVA3_CONTROL_DIR", control.getPath());
         // OpenGL ES calls are executed by the app on the GPU (GlBridge); nothing renders inside qemu.
         env.put("NOVA3_GL_BRIDGE", "1");
@@ -307,7 +310,8 @@ final class GameProcess {
         }
         // settings.txt is written by SettingsActivity and wins over engine_env.txt (RENDER_HEIGHT is ours, not the engine's).
         for (java.util.Map.Entry<String, String> e : SettingsActivity.load(ctx).entrySet())
-            if (!e.getKey().equals("RENDER_HEIGHT") && !e.getKey().startsWith("Q_") && !e.getKey().equals("CPU_PRIME")) env.put(e.getKey(), e.getValue());
+            if (!e.getKey().equals("RENDER_HEIGHT") && !e.getKey().startsWith("Q_") && !e.getKey().equals("CPU_PRIME")
+                    && !e.getKey().equals("AUDIO_LATENCY_MS") && !e.getKey().equals("PERF_HINT")) env.put(e.getKey(), e.getValue());
         applyQualityOverrides(dir, overrides, env);
         // Our qemu: guest syscall counts every 10 s in the log (which ones leave translated code most often).
         env.put("QEMU_SYSCALL_STATS", "1");
@@ -347,7 +351,7 @@ final class GameProcess {
         appendLog("[wrapper] " + b.command());
         process = b.start();
         final Process p = process;
-        perf.start(p);
+        perf.start(p, "1".equals(SettingsActivity.load(ctx).get("PERF_HINT")));
         new Thread(this::writerLoop, "nova3-commands").start();
         new Thread(this::audioLoop, "nova3-audio").start();
         new Thread(() -> {
@@ -385,8 +389,20 @@ final class GameProcess {
         }
     }
 
+    /**
+     * Plays what the port writes into the FIFO (its OpenSL ES, one mixer block per write).
+     *
+     * The AudioTrack is the clock. The pipe is shrunk to one page and the track buffer to the menu's
+     * AUDIO_LATENCY_MS (the device minimum by default), so the port's writer blocks until the speaker has
+     * consumed what came before and the game's mixer is called back at exactly that rate. With a 64 KB pipe
+     * and a 64 KB track buffer, and a writer paced by its own sleep, the sound drifted most of a second late.
+     */
     private void audioLoop() {
         int min = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
+        // 0 (the default) is the smallest buffer the device allows.
+        int latencyMs = 0;
+        try { latencyMs = Integer.parseInt(SettingsActivity.load(ctx).getOrDefault("AUDIO_LATENCY_MS", "0")); } catch (NumberFormatException ignored) { }
+        int bufBytes = Math.max(min, (SAMPLE_RATE * 4 * Math.max(0, Math.min(latencyMs, 1000)) / 1000) & ~3);
         AudioTrack track = new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_GAME)
@@ -395,7 +411,8 @@ final class GameProcess {
                         .setSampleRate(SAMPLE_RATE)
                         .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                         .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-                .setBufferSizeInBytes(Math.max(min * 4, 65536))
+                .setBufferSizeInBytes(bufBytes)
+                .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build();
         FileDescriptor fd = null;
@@ -403,11 +420,19 @@ final class GameProcess {
             // O_RDWR keeps the FIFO open without a writer yet and never reports EOF,
             // so the loop can poll with a timeout and notice when the game stops.
             fd = Os.open(fifo.getPath(), OsConstants.O_RDWR | OsConstants.O_NONBLOCK, 0);
+            int pipe = -1;
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                try { pipe = Os.fcntlInt(fd, 1031 /* F_SETPIPE_SZ */, 4096); } catch (ErrnoException ignored) { }
+            }
+            appendLog("[audio] track buffer " + bufBytes + " bytes (" + bufBytes * 1000L / (SAMPLE_RATE * 4) + " ms, min " + min
+                    + "), pipe " + pipe + " bytes");
             StructPollfd[] polls = { new StructPollfd() };
             polls[0].fd = fd;
             polls[0].events = (short) OsConstants.POLLIN;
             byte[] buf = new byte[16384];
             boolean playing = false;
+            int underruns = 0;
+            long nextReport = SystemClock.elapsedRealtime() + 10000;
             while (running) {
                 polls[0].revents = 0;
                 if (Os.poll(polls, 100) <= 0) continue;
@@ -421,11 +446,18 @@ final class GameProcess {
                     break;
                 }
                 if (n <= 0) continue;
-                // While the game is loading its audio is read and dropped; the CPU
-                // is saturated then and playing it back would only crackle.
-                if (muted) continue;
+                // While the game is loading (or the app is in the background) its audio is replaced by
+                // silence rather than dropped: the track has to stay the game mixer's clock.
+                if (muted) java.util.Arrays.fill(buf, 0, n, (byte) 0);
                 if (!playing) { track.play(); playing = true; }
                 track.write(buf, 0, n);
+                long now = SystemClock.elapsedRealtime();
+                if (now >= nextReport) {
+                    nextReport = now + 10000;
+                    int u = track.getUnderrunCount();
+                    if (u != underruns) appendLog("[audio] speaker ran dry " + (u - underruns) + " time(s) in 10 s");
+                    underruns = u;
+                }
             }
         } catch (ErrnoException ignored) {
         } finally {

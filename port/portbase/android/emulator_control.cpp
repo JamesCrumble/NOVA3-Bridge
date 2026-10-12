@@ -37,6 +37,8 @@
 #include <zlib.h>
 
 #include "khronos/glad.h"
+#include "../src/frame_stats.h"
+#include <time.h>
 #include "trace.h"
 #include "gl_bridge.h"
 
@@ -125,11 +127,30 @@ void emulator_control_init(void)
  * down/up for a pointer already pressed or released this frame waits.
  * Returns false when the line has to wait for the next frame.
  */
+static unsigned g_touch_lines, g_touch_age_max;
+static unsigned long long g_touch_age_sum;
+
 static bool touch_line(const char *line, unsigned *changed)
 {
     int a = 0, x = 0, y = 0, id = 0;
-    if (sscanf(line, "%*s %d %d %d %d", &a, &x, &y, &id) != 4)
+    long long stamp = 0;
+    int got = sscanf(line, "%*s %d %d %d %d %lld", &a, &x, &y, &id, &stamp);
+    if (got < 4)
         return true;
+    if (got == 5 && stamp > 0) {
+        /* The wrapper stamps each line with the touch event's own time (CLOCK_MONOTONIC ms): how
+         * old the finger position is by the time the engine hears of it. */
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long long age = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 - stamp;
+        if (age < 0) age = 0;
+        if (age > 60000) age = 60000;
+        g_touch_lines++;
+        g_touch_age_sum += (unsigned long long)age;
+        if ((unsigned)age > g_touch_age_max) g_touch_age_max = (unsigned)age;
+        if ((unsigned)age > g_port_frame.touch_age_ms) g_port_frame.touch_age_ms = (unsigned)age;
+    }
+    g_port_frame.touches++;
     unsigned bit = 1u << (id & 31);
     if (a != 2) {
         if (*changed & bit)
@@ -144,6 +165,13 @@ bool emulator_control_tick(long frame)
 {
     if (!g_enabled || !g_commands)
         return true;
+
+    if (frame % 600 == 0 && g_touch_lines) {
+        trace("input: %u touch lines, age when delivered avg %.0f ms, max %u ms (before the frame is "
+              "even drawn)", g_touch_lines, (double)g_touch_age_sum / g_touch_lines, g_touch_age_max);
+        g_touch_lines = g_touch_age_max = 0;
+        g_touch_age_sum = 0;
+    }
 
     char line[256];
     unsigned touched = 0;

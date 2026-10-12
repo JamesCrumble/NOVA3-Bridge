@@ -540,7 +540,9 @@ public final class MainActivity extends Activity {
             fingerX[id] = gx;
             fingerY[id] = gy;
             // Moves of one finger replace each other while queued; presses and releases never do.
-            game.command("touch " + action + " " + gx + " " + gy + " " + id, action == 2 ? "touch " + id : null);
+            // The event's own time rides along: the port logs how stale positions are when the engine gets them.
+            game.command("touch " + action + " " + gx + " " + gy + " " + id + " " + e.getEventTime(),
+                    action == 2 ? "touch " + id : null);
         }
 
         /** The phone build's onTouchEvent: 1 for a finger down, 2 for every finger on a move, 0 for a finger up. */

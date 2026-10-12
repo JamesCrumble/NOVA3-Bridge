@@ -99,6 +99,10 @@ public final class SettingsActivity extends Activity {
         col.addView(choice("Уровень деталей", "Q_DETAILS", new int[] { 0, 1, 2 }, 0, "",
                 "0 — полный, 2 — минимальный."));
 
+        col.addView(section("Звук"));
+        col.addView(choice("Буфер звука", "AUDIO_LATENCY_MS", new int[] { 0, 200, 400 }, 0, " мс",
+                "0 — минимальный для телефона, наименьшая задержка. Больше — если звук прерывается в тяжёлых сценах."));
+
         col.addView(section("Производительность"));
         col.addView(choice("Кадров «в полёте»", "NOVA3_GL_INFLIGHT", new int[] { 1, 2, 3 }, 2, "",
                 "Сколько кадров игра готовит вперёд, пока телефон рисует предыдущий. 2 — плавнее, 1 — меньше задержка."));
@@ -106,6 +110,8 @@ public final class SettingsActivity extends Activity {
                 "Разгружает главный поток; на части сцен даёт прирост."));
         col.addView(toggle("Только быстрые ядра (6-7)", "CPU_PRIME", false,
                 "Держит игру на двух самых быстрых ядрах: система реже переносит главный поток на медленные."));
+        col.addView(toggle("Подсказки производительности системе (ADPF)", "PERF_HINT", false,
+                "Сообщает Android время кадра. На OnePlus 13s давало обратный эффект: система занижала частоту ядра игры."));
         col.addView(toggle("Профилирование в логе", "QEMU_GUEST_PROF", true,
                 "Раз в 10 секунд пишет в лог, где игра тратит время. Для отладки."));
 

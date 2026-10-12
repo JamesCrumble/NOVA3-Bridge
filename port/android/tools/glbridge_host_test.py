@@ -160,19 +160,19 @@ def main():
             mode, first, count, nclient = struct.unpack_from("<4i", pay, 0)
             pos = 16
             for _ in range(nclient):
-                idx, size, typ, norm, stride, dlen = struct.unpack_from("<6i", pay, pos)
-                pos += 24 + ((dlen + 3) & ~3)
+                nattr, stride, dlen = struct.unpack_from("<3i", pay, pos)
+                pos += 12 + 20 * nattr + ((dlen + 3) & ~3)
                 draw_client_blocks += 1
                 draw_client_bytes += dlen
             draws += 1
             if pos != len(pay):
                 errors.append("DRAW_ARRAYS layout: parsed %d of %d" % (pos, len(pay)))
         elif name == "OP_DRAW_ELEMENTS":
-            mode, count, typ, idxmode, idxval, nclient = struct.unpack_from("<6i", pay, 0)
-            pos = 24
+            mode, count, typ, idxmode, idxval, nclient, first = struct.unpack_from("<7i", pay, 0)
+            pos = 28
             for _ in range(nclient):
-                idx, size, t2, norm, stride, dlen = struct.unpack_from("<6i", pay, pos)
-                pos += 24 + ((dlen + 3) & ~3)
+                nattr, stride, dlen = struct.unpack_from("<3i", pay, pos)
+                pos += 12 + 20 * nattr + ((dlen + 3) & ~3)
                 draw_client_blocks += 1
                 draw_client_bytes += dlen
             if idxmode == 1:

@@ -49,9 +49,17 @@ final class PerfHint {
         }
     }
 
-    void start(Process p) {
-        if (Build.VERSION.SDK_INT < 31) return;
+    /**
+     * hints == false only remembers the pid for cpuLine(). On the OnePlus 13s the session did the opposite
+     * of what it is for: qemu's main thread, alone of all threads, ended up with uclamp.max 171 of 1024 and
+     * sat at the lowest clock while fully loaded.
+     */
+    void start(Process p, boolean hints) {
         pid = pidOf(p);
+        if (Build.VERSION.SDK_INT < 31 || !hints) {
+            log.log("perf hint: off");
+            return;
+        }
         if (pid <= 0) {
             log.log("perf hint: no pid for " + p);
             return;
@@ -133,10 +141,22 @@ final class PerfHint {
             String base = "/sys/devices/system/cpu/cpu" + cpu + "/cpufreq/";
             long cur = Long.parseLong(readFirstLine(base + "scaling_cur_freq").trim()) / 1000;
             long max = Long.parseLong(readFirstLine(base + "scaling_max_freq").trim()) / 1000;
-            return "cpu" + cpu + " " + cur + "/" + max + " MHz";
+            return "cpu" + cpu + " " + cur + "/" + max + " MHz" + uclampMax(p);
         } catch (Exception e) {
             return "cpu ?";
         }
+    }
+
+    /** " uclamp N" when the scheduler caps what the main thread's load may ask of the clock (1024 = no cap). */
+    private static String uclampMax(int p) {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/proc/" + p + "/task/" + p + "/sched"))) {
+            String l;
+            while ((l = r.readLine()) != null) {
+                if (l.startsWith("effective uclamp.max")) return " uclamp " + l.substring(l.indexOf(':') + 1).trim();
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
     }
 
     private static String readFirstLine(String path) throws java.io.IOException {

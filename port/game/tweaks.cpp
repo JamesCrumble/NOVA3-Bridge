@@ -19,13 +19,21 @@
  *                               out of translated code on every call. The literal holding that
  *                               address is pointed at a small ldrex/strex routine instead.
  *
+ *   <PREFIX>_UCLAMP=0           leave the scheduler's clamp on the main thread alone (see
+ *                               nova3_sched_tick; on by default).
+ *   <PREFIX>_UCLAMP_MIN=0..1024 also ask for at least this much (0 by default).
+ *
  * The setter is forced rather than called once: the profile is applied again
  * whenever a level loads, and a one-off call would be undone by it.
  * DeviceOptions::SetUsePhysicsThread(bool) is a local symbol of the 1.0.7
  * library (.symtab only), found by offset like the XML hooks.
  */
+#include <errno.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
@@ -162,5 +170,70 @@ void nova3_tweaks_install(so_module *mod)
             rehook_hook(&g_fov_hook);
             trace("tweaks: field of view x%.2f", g_fov_scale);
         }
+    }
+}
+
+/*
+ * The phone's scheduler puts a utilisation clamp on the game's main thread a few seconds into a
+ * mission: uclamp.max 171-199 of 1024, on that one thread and no other. To the frequency governor the
+ * thread then never looks more than a fifth loaded, and the core stays at its lowest clock while the
+ * thread is in fact saturated (util 1023, 1.0 GHz of 4.3). The clamp is a per-task attribute its owner
+ * may set, so the main thread sets it back - again and again, because whatever lowers it does so
+ * repeatedly.
+ *
+ * sched_setattr is not something Android apps normally call, and a system call the seccomp filter
+ * does not know kills the process, so the first call is made in a forked child.
+ */
+struct nova3_sched_attr {
+    uint32_t size, sched_policy;
+    uint64_t sched_flags;
+    int32_t  sched_nice;
+    uint32_t sched_priority;
+    uint64_t sched_runtime, sched_deadline, sched_period;
+    uint32_t sched_util_min, sched_util_max;
+};
+
+static int set_uclamp(uint32_t lo)
+{
+    nova3_sched_attr a;
+    memset(&a, 0, sizeof(a));
+    a.size = sizeof(a);
+    a.sched_flags = 0x08 /* KEEP_POLICY */ | 0x10 /* KEEP_PARAMS */ | 0x20 /* UTIL_CLAMP_MIN */ | 0x40 /* UTIL_CLAMP_MAX */;
+    a.sched_util_min = lo;
+    a.sched_util_max = 1024;
+    return syscall(SYS_sched_setattr, 0, &a, 0) == 0 ? 0 : errno;
+}
+
+void nova3_sched_tick(long frames)
+{
+    static int state = -1;      /* -1 not tried, 0 off, 1 working */
+    static uint32_t lo;
+
+    if (state == 0 || (state == 1 && frames % 8 != 0))
+        return;
+    if (state < 0) {
+        state = 0;
+        if (!port_getenv_long("UCLAMP", 1))
+            return;
+        long v = port_getenv_long("UCLAMP_MIN", 0);
+        lo = v < 0 ? 0 : v > 1024 ? 1024 : (uint32_t)v;
+        pid_t child = fork();
+        if (child < 0)
+            return;
+        if (child == 0)
+            _exit(set_uclamp(lo) & 0x7f);
+        int st = 0;
+        if (waitpid(child, &st, 0) != child || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+            trace("tweaks: uclamp: sched_setattr unusable here (%s %d) - left alone",
+                  WIFEXITED(st) ? "errno" : "signal", WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st));
+            return;
+        }
+        state = 1;
+        trace("tweaks: uclamp: main thread kept at min %u, max 1024", lo);
+    }
+    int e = set_uclamp(lo);
+    if (e) {
+        trace("tweaks: uclamp: sched_setattr failed (errno %d) - stopped", e);
+        state = 0;
     }
 }

@@ -73,8 +73,12 @@ final class GlBridge implements Runnable {
     private boolean surfaceDirty;
 
     private FileDescriptor cmd, rep;
-    private final ByteBuffer hdr = ByteBuffer.allocateDirect(8).order(ByteOrder.LITTLE_ENDIAN);
-    private ByteBuffer pay = ByteBuffer.allocateDirect(1 << 20).order(ByteOrder.LITTLE_ENDIAN);
+    // Everything read from the command pipe and not yet executed: in[rpos, wpos). pay is a view of the
+    // same memory, narrowed to the payload of the message being executed.
+    private ByteBuffer in = ByteBuffer.allocateDirect(2 << 20).order(ByteOrder.LITTLE_ENDIAN);
+    private ByteBuffer pay = in.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+    private int rpos, wpos;
+    private final StructPollfd[] cmdPoll = { new StructPollfd() };
     private ByteBuffer out = ByteBuffer.allocateDirect(1 << 16).order(ByteOrder.LITTLE_ENDIAN);
 
     private EGLDisplay dpy = EGL14.EGL_NO_DISPLAY;
@@ -221,23 +225,25 @@ final class GlBridge implements Runnable {
         try { if (rep != null) Os.close(rep); } catch (ErrnoException ignored) { }
     }
 
+    /**
+     * The guest writes its commands in batches of up to a megabyte, and a busy scene is 80 000 commands
+     * a second. Reading them one at a time (a header, then a payload) was two system calls for each,
+     * and the guest's main thread stood in write() waiting for this thread to get through them. So the
+     * pipe is emptied in whole chunks and the messages are executed where they lie.
+     */
     private void loop() throws ErrnoException, InterruptedIOException {
         while (alive) {
-            if (!readFully(hdr, 8)) return;
-            int len = hdr.getInt(0), op = hdr.getInt(4);
+            if (!need(8)) return;
+            int len = in.getInt(rpos), op = in.getInt(rpos + 4);
             int plen = len - 8;
             if (len < 8 || (len & 3) != 0 || plen > (128 << 20)) {
                 log.log("bad message length " + len + " (op " + op + "), stopping");
                 return;
             }
-            if (plen > pay.capacity()) {
-                int c = pay.capacity();
-                while (c < plen) c *= 2;
-                pay = ByteBuffer.allocateDirect(c).order(ByteOrder.LITTLE_ENDIAN);
-            }
-            if (plen > 0 && !readFully(pay, plen)) return;
-            pay.clear();
-            pay.limit(plen);
+            if (!need(len)) return;
+            pay.limit(rpos + len);
+            pay.position(rpos + 8);
+            rpos += len;
             cmds++;
             bytes += len;
             if (op >= 0 && op < opCounts.length) {
@@ -254,28 +260,57 @@ final class GlBridge implements Runnable {
         }
     }
 
-    /** Fills the first n bytes of b from the command pipe; false when asked to stop. */
-    private boolean readFully(ByteBuffer b, int n) throws ErrnoException, InterruptedIOException {
-        b.clear();
-        b.limit(n);
-        while (b.hasRemaining()) {
+    /** Makes in[rpos, rpos + n) available, reading as much as the pipe has; false when asked to stop. */
+    private boolean need(int n) throws ErrnoException, InterruptedIOException {
+        if (wpos - rpos >= n) return true;
+        if (rpos == wpos) rpos = wpos = 0;
+        if (rpos + n > in.capacity()) {
+            // The message does not fit behind what is already there: move the unread tail to the front,
+            // into a larger buffer if even that is not enough.
+            ByteBuffer to = in;
+            if (n > in.capacity()) {
+                int c = in.capacity();
+                while (c < n) c *= 2;
+                to = ByteBuffer.allocateDirect(c).order(ByteOrder.LITTLE_ENDIAN);
+            }
+            ByteBuffer tail = in.duplicate();
+            tail.limit(wpos);
+            tail.position(rpos);
+            if (to == in) {
+                in.clear();
+                in.position(rpos);
+                in.limit(wpos);
+                in.compact();
+            } else {
+                to.clear();
+                to.put(tail);
+                in = to;
+                pay = in.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+            }
+            wpos -= rpos;
+            rpos = 0;
+        }
+        while (wpos - rpos < n) {
+            if (!alive) return false;
+            in.limit(in.capacity());
+            in.position(wpos);
+            int r;
             try {
-                int r = Os.read(cmd, b);
-                if (r == 0) pollReadable();
+                r = Os.read(cmd, in);
             } catch (ErrnoException e) {
                 if (e.errno != OsConstants.EAGAIN) throw e;
-                if (!pollReadable() && !alive) return false;
+                r = 0;
             }
-            if (!alive) return false;
+            if (r > 0) {
+                wpos += r;
+                continue;
+            }
+            cmdPoll[0].fd = cmd;
+            cmdPoll[0].events = (short) OsConstants.POLLIN;
+            cmdPoll[0].revents = 0;
+            Os.poll(cmdPoll, POLL_MS);
         }
         return true;
-    }
-
-    private boolean pollReadable() throws ErrnoException, InterruptedIOException {
-        StructPollfd p = new StructPollfd();
-        p.fd = cmd;
-        p.events = (short) OsConstants.POLLIN;
-        return Os.poll(new StructPollfd[] { p }, POLL_MS) > 0;
     }
 
     // ---------------------------------------------------------------- replies
@@ -486,29 +521,36 @@ final class GlBridge implements Runnable {
         }
     }
 
-    /** Uploads the client arrays of one draw into scratch buffers and points the attributes at them. */
+    /**
+     * Uploads the client arrays of one draw into scratch buffers and points the attributes at them.
+     * A block is one run of client memory with every attribute that reads from it (interleaved arrays
+     * arrive once, not once per attribute); it starts at firstVertex, and the buffer leaves that much
+     * room in front so vertex numbers keep their meaning.
+     */
     private void clientBlocks(int nclient, int firstVertex) {
         for (int k = 0; k < nclient; k++) {
-            int idx = i(), size = i(), type = i(), norm = i(), stride = i(), len = i();
+            int nattr = i(), stride = i(), len = i();
+            int at = pay.position();
+            pay.position(at + nattr * 20);
             ByteBuffer d = data(len);
-            if (idx < 0 || idx >= scratchVbo.length) continue;
-            if (scratchVbo[idx] == 0) {
+            if (k >= scratchVbo.length) continue;
+            if (scratchVbo[k] == 0) {
                 int[] t = one();
                 GLES30.glGenBuffers(1, t, 0);
-                scratchVbo[idx] = t[0];
+                scratchVbo[k] = t[0];
             }
-            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, scratchVbo[idx]);
-            int eb = size * (type == GLES30.GL_FLOAT || type == GLES30.GL_INT || type == GLES30.GL_UNSIGNED_INT ? 4
-                    : (type == GLES30.GL_SHORT || type == GLES30.GL_UNSIGNED_SHORT ? 2 : 1));
-            int strideBytes = stride != 0 ? stride : eb;
-            int lead = firstVertex * strideBytes;
+            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, scratchVbo[k]);
+            int lead = firstVertex * stride;
             if (lead == 0) {
                 GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, len, d, GLES30.GL_STREAM_DRAW);
             } else {
                 GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, lead + len, null, GLES30.GL_STREAM_DRAW);
                 GLES30.glBufferSubData(GLES30.GL_ARRAY_BUFFER, lead, len, d);
             }
-            GLES30.glVertexAttribPointer(idx, size, type, norm != 0, stride, 0);
+            for (int a = 0; a < nattr; a++, at += 20) {
+                GLES30.glVertexAttribPointer(pay.getInt(at), pay.getInt(at + 4), pay.getInt(at + 8),
+                        pay.getInt(at + 12) != 0, stride, pay.getInt(at + 16));
+            }
         }
         if (nclient > 0) GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, ids.buf.get(curArray));
     }
@@ -520,8 +562,8 @@ final class GlBridge implements Runnable {
     }
 
     private void drawElements() {
-        int mode = i(), count = i(), type = i(), idxMode = i(), idxVal = i(), nclient = i();
-        clientBlocks(nclient, 0);
+        int mode = i(), count = i(), type = i(), idxMode = i(), idxVal = i(), nclient = i(), firstVertex = i();
+        clientBlocks(nclient, firstVertex);
         if (idxMode == 1) {
             ByteBuffer d = data(idxVal);
             if (scratchEbo == 0) {

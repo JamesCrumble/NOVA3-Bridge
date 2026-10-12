@@ -29,7 +29,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+
 #include <deque>
+#include <vector>
 
 #include <SDL2/SDL.h>
 
@@ -330,6 +336,10 @@ struct Player {
 
     /* Buffers the game has handed us and we have not called back for yet. */
     std::deque<SLuint32> pending;
+    /* Direct output (see fifo_thread_main): the blocks themselves, one per
+     * entry of `pending`. Empty for a player that plays through SDL. */
+    bool direct;
+    std::deque<std::vector<uint8_t> > fifo_data;
     slBufferQueueCallback callback;
     void                 *callback_ctx;
 
@@ -392,6 +402,27 @@ struct AudioLock {
  * realized before that point in the file. */
 static void audio_thread_start(void);
 
+/*
+ * Direct output: <PREFIX>_AUDIO_FIFO names a pipe whose reader plays 44.1 kHz
+ * stereo s16 (the Android wrapper's AudioTrack), and the one player with that
+ * format writes its blocks straight into it. See fifo_thread_main.
+ */
+static Player     *g_fifo_player = NULL;
+static int         g_fifo_fd     = -1;
+static uint32_t    g_fifo_epoch  = 0;     /* bumped whenever queued blocks are dropped */
+static SDL_Thread *g_fifo_thread = NULL;
+static bool        g_fifo_run    = false;
+
+static bool fifo_attach(Player *p);
+
+static void fifo_forget(Player *p)
+{
+    if (!p->direct)
+        return;
+    p->fifo_data.clear();
+    g_fifo_epoch++;
+}
+
 static int bytes_per_sample(const Player *p)
 {
     return (p->bits / 8) * p->channels;
@@ -452,7 +483,7 @@ static void report_enqueued(const Player *p, const void *buffer, SLuint32 size)
         trace("opensl: enqueued block=%lu bytes=%u nonzero=%u peak=%u "
               "device=%s%s",
               block, (unsigned)size, nonzero, peak,
-              p->device ? "open" : "none",
+              p->device ? "open" : p->direct ? "pipe" : "none",
               first_sound ? "  <- first audible block" : "");
     }
 }
@@ -468,6 +499,8 @@ static ABI_ATTR SLresult bq_Enqueue(SLBufferQueueItf self, const void *buffer, S
 
     if (p->device)
         SDL_QueueAudio(p->device, buffer, size);
+    if (p->direct)
+        p->fifo_data.emplace_back((const uint8_t *)buffer, (const uint8_t *)buffer + size);
 
     p->pending.push_back(size);
     return SL_RESULT_SUCCESS;
@@ -483,6 +516,7 @@ static ABI_ATTR SLresult bq_Clear(SLBufferQueueItf self)
     if (p->device)
         SDL_ClearQueuedAudio(p->device);
     p->pending.clear();
+    fifo_forget(p);
     p->carry_bytes = 0.0;
     return SL_RESULT_SUCCESS;
 }
@@ -565,6 +599,7 @@ static const SLAndroidConfigurationItf_ kAndroidConfigurationVt = {
  * ------------------------------------------------------------------ */
 static ABI_ATTR SLresult play_SetPlayState(SLPlayItf self, SLuint32 state)
 {
+    AudioLock lock;
     Player *p = ((Iface<SLPlayItf_, Player> *)self)->owner;
     if (!p)
         return SL_RESULT_PARAMETER_INVALID;
@@ -576,6 +611,7 @@ static ABI_ATTR SLresult play_SetPlayState(SLPlayItf self, SLuint32 state)
         if (p->device)
             SDL_ClearQueuedAudio(p->device);
         p->pending.clear();
+        fifo_forget(p);
     }
     p->last_drain_ms = SDL_GetTicks();
     return SL_RESULT_SUCCESS;
@@ -826,7 +862,9 @@ static ABI_ATTR SLresult player_Realize(SLObjectItf self, SLboolean async)
     want.samples  = 1024;
     want.callback = NULL;            /* queue-driven, like the game's own model */
 
-    if (g_audio_up && p->decodes) {
+    if (p->decodes && fifo_attach(p)) {
+        /* Nothing to open: the pipe's reader is the device. */
+    } else if (g_audio_up && p->decodes) {
         /*
          * On the R36S the default device comes back "Device or resource busy":
          * something else - EmulationStation's menu music is the candidate -
@@ -1008,6 +1046,9 @@ static ABI_ATTR void player_Destroy(SLObjectItf self)
 
     if (p->device)
         SDL_CloseAudioDevice(p->device);
+    fifo_forget(p);
+    if (g_fifo_player == p)
+        g_fifo_player = NULL;
 
     for (Player **it = &g_players; *it; it = &(*it)->next) {
         if (*it == p) {
@@ -1208,6 +1249,7 @@ static ABI_ATTR SLresult eng_CreateAudioPlayer(SLEngineItf self, SLObjectItf *pl
     if (p->bits != 8)    p->bits     = 16;
 
     p->device        = 0;
+    p->direct        = false;
     p->state         = SL_PLAYSTATE_STOPPED;
     p->level         = 0;
     p->muted         = false;
@@ -1406,7 +1448,7 @@ extern "C" void android_opensles_pump(void)
     uint32_t now = SDL_GetTicks();
 
     for (Player *p = g_players; p; p = p->next) {
-        if (!p->callback)
+        if (!p->callback || p->direct)
             continue;
         /* Nothing queued and not playing is a player that has not started, not
          * one that is starving. Calling back into the mixer then would ask it
@@ -1550,6 +1592,163 @@ extern "C" void android_opensles_pump(void)
             p->drain_window_ms = 0;
         }
     }
+}
+
+/*
+ * Direct output: the speaker is the clock.
+ *
+ * Through SDL's "disk" device the same bytes took a longer road - SDL's queue,
+ * a device thread paced by a sleep, the pipe, the reader's AudioTrack - and two
+ * things went wrong on it. The sleep is a whole number of milliseconds (23 for
+ * a 23.2 ms period), so the device ran about 1% ahead of real time and the
+ * surplus piled up in the pipe and in the track's buffer until both were full,
+ * most of a second late. And the device takes 4096 bytes at a time while this
+ * game's mixer keeps at most two 4056-byte blocks queued, so every couple of
+ * seconds the device found less than it wanted and padded it with silence.
+ *
+ * Here a block goes into the pipe as it is, the write waits until the reader
+ * has room, and only then is the block retired and the game called back for
+ * the next one - which is what OpenSL ES does on a phone, where the callback
+ * means "a buffer has finished playing". The reader keeps the pipe at one
+ * page and blocks in AudioTrack.write, so nothing between the mixer and the
+ * speaker can run ahead, and nothing is ever padded.
+ *
+ * The lock is not held across the write: the game's own threads call into the
+ * player (SetPlayState, Clear) and must not wait for the speaker.
+ */
+static bool fifo_write(const std::vector<uint8_t> &block)
+{
+    size_t off = 0;
+    while (off < block.size() && g_fifo_run) {
+        ssize_t n = write(g_fifo_fd, block.data() + off, block.size() - off);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && errno != EAGAIN)
+            return false;
+        struct pollfd pfd = { g_fifo_fd, POLLOUT, 0 };
+        poll(&pfd, 1, 100);
+    }
+    return off == block.size();
+}
+
+static int fifo_thread_main(void *)
+{
+    std::vector<uint8_t> block;
+    uint64_t      bytes = 0;
+    unsigned long blocks = 0, starved = 0;
+    uint32_t      window_start = SDL_GetTicks(), worst_ms = 0;
+
+    while (g_fifo_run) {
+        Player  *p;
+        uint32_t epoch = 0;
+
+        block.clear();
+        {
+            AudioLock lock;
+            p = g_fifo_player;
+            if (p && p->state == SL_PLAYSTATE_PLAYING) {
+                /* Nothing queued: the mixer has to be asked for its first
+                 * block, and asked again if it ever let the queue run out. */
+                if (p->fifo_data.empty() && p->callback) {
+                    p->callback((SLBufferQueueItf)&p->queue, p->callback_ctx);
+                    if (p->fifo_data.empty())
+                        starved++;
+                }
+                if (!p->fifo_data.empty()) {
+                    block = p->fifo_data.front();
+                    epoch = g_fifo_epoch;
+                }
+            }
+        }
+
+        if (block.empty()) {
+            SDL_Delay(5);
+            continue;
+        }
+
+        uint32_t t0 = SDL_GetTicks();
+        if (!fifo_write(block)) {
+            if (g_fifo_run)
+                warning("OpenSL ES: writing to the audio pipe failed (%s); "
+                        "sound stops here.\n", strerror(errno));
+            break;
+        }
+        uint32_t waited = SDL_GetTicks() - t0;
+        if (waited > worst_ms)
+            worst_ms = waited;
+        bytes += block.size();
+
+        {
+            AudioLock lock;
+            /* The queue may have been cleared, or the player destroyed, while
+             * the block was on its way out. */
+            if (g_fifo_player == p && g_fifo_epoch == epoch && !p->fifo_data.empty()) {
+                p->fifo_data.pop_front();
+                p->pending.pop_front();
+                if (p->callback)
+                    p->callback((SLBufferQueueItf)&p->queue, p->callback_ctx);
+            }
+
+            if (++blocks % 1024 == 0) {
+                uint32_t now = SDL_GetTicks();
+                /* 44100 Hz stereo s16, the only format fifo_attach accepts. */
+                double   ms  = (double)bytes / 176.4;
+                trace("opensl: direct out - %.0f%% of real time over %u ms, "
+                      "longest wait for the speaker %u ms, mixer had nothing "
+                      "%lu time(s)",
+                      now > window_start ? 100.0 * ms / (double)(now - window_start) : 0.0,
+                      now - window_start, worst_ms, starved);
+                bytes        = 0;
+                worst_ms     = 0;
+                window_start = now;
+            }
+        }
+    }
+    return 0;
+}
+
+static bool fifo_attach(Player *p)
+{
+    const char *path = port_getenv("AUDIO_FIFO");
+    if (!path || !*path || g_fifo_player)
+        return false;
+    if (p->freq != 44100 || p->channels != 2 || p->bits != 16) {
+        warning("OpenSL ES: " PORT_ENV_PREFIX "_AUDIO_FIFO wants 44100 Hz/2 ch"
+                "/16-bit and the game mixes %d Hz/%d ch/%d-bit; falling back "
+                "to SDL.\n", p->freq, p->channels, p->bits);
+        return false;
+    }
+    if (g_fifo_fd < 0) {
+        /* O_RDWR: opening never waits for the reader and never fails for the
+         * lack of one. */
+        g_fifo_fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (g_fifo_fd < 0) {
+            warning("OpenSL ES: cannot open the audio pipe %s (%s); falling "
+                    "back to SDL.\n", path, strerror(errno));
+            return false;
+        }
+    }
+
+    p->direct     = true;
+    g_fifo_player = p;
+    if (!g_fifo_thread) {
+        g_fifo_run    = true;
+        g_fifo_thread = SDL_CreateThread(fifo_thread_main, "portbase-audio-out", NULL);
+        if (!g_fifo_thread) {
+            g_fifo_run    = false;
+            g_fifo_player = NULL;
+            p->direct     = false;
+            warning("OpenSL ES: could not start the audio output thread (%s); "
+                    "falling back to SDL.\n", SDL_GetError());
+            return false;
+        }
+    }
+    trace("opensl: player ready - direct output to %s, paced by its reader", path);
+    return true;
 }
 
 /*

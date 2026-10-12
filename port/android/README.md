@@ -37,7 +37,7 @@
 | графика | 2 FIFO-пайпа: команды GL туда, ответы на синхронные запросы и подтверждения кадров обратно |
 | ввод | текстовый файл `ctl/commands` (`touch 1 x y id`, `key 4 down`, `pad 1`…), порт читает каждый кадр |
 | состояние | `ctl/status.json` (кадр, меню/игра) |
-| звук | SDL «disk» → FIFO → `AudioTrack` |
+| звук | OpenSL ES порта → FIFO → `AudioTrack` (темп задаёт `AudioTrack`; SDL «disk» — запасной путь) |
 | настройки | файлы рядом с логом (`gpu_name.txt`, `engine_env.txt`, `xml_override.txt`, `cpu_mask.txt`…) и переменные окружения |
 
 ### Путь графики

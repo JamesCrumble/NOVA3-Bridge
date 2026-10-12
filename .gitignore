@@ -25,3 +25,4 @@ __pycache__/
 /scratch/
 /release/
 /port/android/build/release.*
+release.pass

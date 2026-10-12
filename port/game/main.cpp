@@ -497,6 +497,7 @@ int main(int argc, char **argv)
 
         if (!emulator_control_tick(frames))
             goto done;
+        nova3_sched_tick(frames);
         android_input_tick();
         android_input_autopilot_tick(frames);
 

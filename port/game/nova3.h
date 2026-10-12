@@ -44,6 +44,8 @@ void nova3_unlock_drm(so_module *mod);
 void nova3_xml_hook_install(so_module *mod);
 /* Engine settings forced over the device profile. tweaks.cpp */
 void nova3_tweaks_install(so_module *mod);
+/* Once per frame: undoes the scheduler's clamp on the main thread. tweaks.cpp */
+void nova3_sched_tick(long frames);
 
 /*
  * Hand the engine its four directories.
