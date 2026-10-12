@@ -1,5 +1,11 @@
 # NOVA3 Bridge
 
+**English:** run **N.O.V.A. 3 1.0.7** (Gameloft, 32-bit ARMv7) on 64-bit-only Android phones that have no
+AArch32 support. The game runs under a patched `qemu-user`, and its OpenGL ES calls are forwarded to the phone's
+real GPU. Tested on a OnePlus 13s (Snapdragon 8 Elite). No game files are included: you need your own copy.
+Ready-made APK: [Releases](https://github.com/JamesCrumble/NOVA3-Bridge/releases).
+The rest of this page is in Russian.
+
 Запуск 32-битной **N.O.V.A. 3** (Gameloft, v1.0.7, только `armeabi-v7a`) на 64-битных Android-телефонах, в которых
 нет поддержки AArch32. Проверено на OnePlus 13s (Snapdragon 8 Elite, Android 15).
 
@@ -10,7 +16,7 @@
 
 [Состояние](#состояние) · [Установка](#установка) · [Настройки](#настройки) · [Как это устроено](#как-это-устроено) ·
 [Производительность](#производительность) · [Структура](#структура) · [Сборка](#сборка) · [Диагностика](#диагностика) ·
-[Лицензия и авторство](#лицензия-и-авторство)
+[Другие игры](#другие-игры) · [Лицензия и авторство](#лицензия-и-авторство)
 
 ## Состояние
 
@@ -170,6 +176,13 @@ docker run --rm -u 1000:1000 -e HOME=/tmp -v "$PWD":/work nova3-qemu-build \
 - Профиль кода игры пишется в лог, пока включена настройка «Профилирование в логе».
 - Профиль самого qemu: `tools/profile.sh <секунд>` (simpleperf; приложение `profileable`).
 - Частоты, ядра и температуры: `tools/cpu_diag.sh`.
+
+## Другие игры
+
+Тот же способ запуска — qemu-user и мост GLES на GPU телефона — для других 32-битных игр:
+
+- [Shadowgun Bridge](https://github.com/JamesCrumble/shadowgun-bridge) — SHADOWGUN 1.7.0 (Unity 5.3)
+- [Mass Effect Infiltrator Bridge](https://github.com/JamesCrumble/mass-effect-infiltrator-bridge) — Mass Effect Infiltrator 1.0.58
 
 ## Лицензия и авторство
 
