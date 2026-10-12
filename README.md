@@ -28,7 +28,9 @@ tools/build_install.sh       # порт + APK + установка на теле
 ## Лицензия
 
 GPL-3.0 (см. `LICENSE`, происхождение частей — `port/NOTICE.md`). Патч qemu — GPL-2.0-or-later, как сам QEMU.
-Порт N.O.V.A. 3 для PortMaster, на котором основан проект, создан EapRules.
+Порт N.O.V.A. 3 для PortMaster, на котором основан проект (`port/`, кроме `port/android/`), создан EapRules.
+Android-мост — APK-обёртка `port/android/`, проброс GLES на GPU телефона (`port/portbase/src/gl_bridge*`),
+патчи qemu (`qemu/`) и скрипты `tools/` — написан JamesCrumble.
 N.O.V.A. 3 © Gameloft.
 
 ## Релизы и настройки

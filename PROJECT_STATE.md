@@ -19,7 +19,7 @@ Oryon, только AArch64, Android/OxygenOS 15+), подключён по USB,
 ## Архитектура APK
 - Игра (ARM32, softfp) исполняется в **своём qemu-arm 11.1.2** (статический aarch64, в APK как `libqemu.so`),
   порт-лоадер `build/nova3` (armhf) + armhf sysroot. Данные игры: APK (libNOVA3_neon.so) в
-  `Android/data/com.eaprules.nova3/files/`, OBB в `Android/obb/com.eaprules.nova3/`.
+  `Android/data/com.jamescrumble.nova3/files/`, OBB в `Android/obb/com.jamescrumble.nova3/`.
 - **GPU-мост**: все GLES-вызовы игры сериализуются в пайп (`portbase/src/gl_bridge.cpp`), Java (`GlBridge.java`)
   исполняет их на Adreno 830 через EGL/GLES30 на SurfaceView. Синхронные запросы — второй пайп.
 - Ввод: «обычный телефон» (`NOVA3_TOUCH=1`, `nativePowerStatus(false)`), сырой мультитач в `touchEvent`
@@ -30,7 +30,7 @@ Oryon, только AArch64, Android/OxygenOS 15+), подключён по USB,
 - Манифест: `debuggable=false` (CheckJNI резал GL-поток), `profileable shell=true`, `isGame`, `game_mode_config`
   (supportsPerformanceGameMode). ADPF: `PerfHint.java` — hint-сессия на потоки qemu, отчёт длительности кадров.
 
-## Файлы-настройки рядом с логом (Android/data/com.eaprules.nova3/files/)
+## Файлы-настройки рядом с логом (Android/data/com.jamescrumble.nova3/files/)
 - `nova3.log` — лог игры и обёртки (пересоздаётся при запуске).
 - `gpu_name.txt` — подмена GL_RENDERER (сейчас `Adreno (TM) 320` -> профиль GPU_3 вместо GPU_5).
 - `engine_env.txt` — KEY=VALUE в окружение порта (сейчас `NOVA3_GL_PROFILE=1`).
@@ -54,7 +54,7 @@ Oryon, только AArch64, Android/OxygenOS 15+), подключён по USB,
   **ленивое FPCR для NEON** (NEON 6,7× на стенде: писать FPCR на Oryon очень дорого). Стенд: `tools/bench_phone.sh`,
   бенчмарк `armbench`, варианты в `qemu-build/out/qemu-arm-<V>.stripped`, сборка `qemu-build/build_variant.sh`.
 - Патч qemu и сборочные файлы скопированы в репозиторий: `nova3-native-arm/android/qemu/` (README там).
-- Системный game mode `performance` выставлен (`cmd game mode performance com.eaprules.nova3`).
+- Системный game mode `performance` выставлен (`cmd game mode performance com.jamescrumble.nova3`).
 - Телеметрия в логе: ядро и частота главного потока qemu (`| cpuN cur/max MHz` в строке `[gl] frames`).
 - `cpu_mask.txt` (hex, напр. `c0`) рядом с логом закрепляет qemu на ядрах через taskset — встроено, НЕ включено.
 - Tango (системный транслятор ARM32) в глобальной прошивке отсутствует (`1554_Tango` — это оператор связи).
@@ -95,7 +95,7 @@ Oryon, только AArch64, Android/OxygenOS 15+), подключён по USB,
 ## План (по приоритету)
 P0 (телефон, минуты): проверить Tango (системный ARM32-транслятор OnePlus/OPPO: `ro.product.cpu.abilist`,
 `ro.dalvik.vm.native.bridge`, libtango) и запуск оригинальной NOVA 3 (установлена у пользователя);
-`cmd game mode performance com.eaprules.nova3`; добавить игру в приложение Games; телеметрия частоты ядра qemu в логе.
+`cmd game mode performance com.jamescrumble.nova3`; добавить игру в приложение Games; телеметрия частоты ядра qemu в логе.
 P1: стенд бенчмарков qemu на телефоне (/data/local/tmp) -> E1 jmp-cache 12->16 бит, E4 -O3/LTO/-march, E5 VFP-хелперы,
 E2 быстрый lookup_tb_ptr, E6 больше NEON; аппаратный скиннинг (найти хранение опции HardwareSkinning);
 отключение дорогих эффектов через сеттеры DeviceOptions; E7 -perfmap (TMPDIR) + символы игры.

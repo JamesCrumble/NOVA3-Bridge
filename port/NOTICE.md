@@ -7,6 +7,10 @@ the licences differ and the originals must keep their attribution.
 The N.O.V.A. 3 PortMaster port, its project direction and the `eapx`
 extraction tool were created by **EapRules**.
 
+The Android bridge in this repository - the APK wrapper (`android/`), the GLES bridge to the phone's GPU
+(`portbase/src/gl_bridge*`), the qemu patches (`../qemu/`) and the phone scripts (`../tools/`) - was written
+by **JamesCrumble** on top of that port.
+
 ## Where the code comes from
 
 | Part | Origin | Licence |
@@ -22,7 +26,8 @@ extraction tool were created by **EapRules**.
 | `portbase/src/vfp_vector_patch.cpp` register decoding/scalar emission | adapted from VFPVector by **Bythos14** | MIT |
 | SWP/SWPB emulation in the SIGILL handler | written for this port family; the technique follows the Vita so-loader lineage | GPL-3.0 |
 | `tools/eapx.py` — transactional first-boot donor extractor | written by **EapRules** | GPL-3.0 |
-| `game/`, `harness/`, `ports/` | written for this port | GPL-3.0 |
+| `game/`, `harness/`, `ports/` | written for this port by **EapRules** | GPL-3.0 |
+| `android/`, `portbase/src/gl_bridge*`, `../qemu/`, `../tools/` | Android bridge by **JamesCrumble** | GPL-3.0 (qemu patches: GPL-2.0-or-later, as QEMU) |
 
 Unlike its sibling ports, N.O.V.A. 3 has no reference port to take patch
 offsets from: nothing in the engine is patched by address. The licence check

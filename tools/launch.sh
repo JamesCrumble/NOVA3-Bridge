@@ -5,5 +5,5 @@ A=$P/tools/adb
 if [ "${1:-}" = install ]; then
   $A install -r "$(wslpath -w $P/port/NOVA3-ARM32-debug.apk)" || exit 1
 fi
-$A shell am force-stop com.eaprules.nova3
-$A shell am start -n com.eaprules.nova3/.MainActivity
+$A shell am force-stop com.jamescrumble.nova3
+$A shell am start -n com.jamescrumble.nova3/.MainActivity

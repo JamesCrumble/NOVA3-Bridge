@@ -1,4 +1,4 @@
-package com.eaprules.nova3;
+package com.jamescrumble.nova3;
 
 import android.content.Context;
 import android.media.AudioAttributes;

@@ -3,7 +3,7 @@
 #   NOVA3-Bridge-<v>.apk          release-signed APK (not debuggable)
 #   NOVA3-Bridge-<v>-src.zip      source of the committed HEAD
 #   <original game APK>           the player's own copy, to go into Android/data/.../files/
-#   *.obb                         game data, to go into Android/obb/com.eaprules.nova3/
+#   *.obb                         game data, to go into Android/obb/com.jamescrumble.nova3/
 #   INSTALL.txt, SHA256SUMS
 # Usage: tools/make_release.sh   (run from WSL; commit first - the source zip is HEAD)
 set -euo pipefail

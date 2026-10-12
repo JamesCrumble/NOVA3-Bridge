@@ -7,7 +7,7 @@
 ## Архитектура
 
 ```
- APK com.eaprules.nova3 (Java, без NDK)                        Телефон: Oryon (только AArch64), Adreno 830
+ APK com.jamescrumble.nova3 (Java, без NDK)                        Телефон: Oryon (только AArch64), Adreno 830
  ┌───────────────────────────────────────────────────────┐
  │ MainActivity   SurfaceView + оверлей (FPS, загрузка)  │
  │                мультитач/кнопки/геймпад → команды     │
@@ -74,9 +74,9 @@
 После установки APK положить свои файлы игры:
 
 ```text
-/sdcard/Android/data/com.eaprules.nova3/files/
+/sdcard/Android/data/com.jamescrumble.nova3/files/
   N-O-V-A-3-Near-Orbit-Vanguard-Alliance-v1-0-7.apk
-/sdcard/Android/obb/com.eaprules.nova3/
+/sdcard/Android/obb/com.jamescrumble.nova3/
   main.1050.com.gameloft.android.ANMP.GloftN3HM.obb
   patch.1070.com.gameloft.android.ANMP.GloftN3HM.obb
 ```
@@ -102,7 +102,7 @@ QEMU_BIN=/path/to/qemu-arm.stripped JAVA_HOME=/path/to/jdk bash android/build_ap
 
 ## Настройки и отладка
 
-Всё лежит в `Android/data/com.eaprules.nova3/files/`:
+Всё лежит в `Android/data/com.jamescrumble.nova3/files/`:
 
 | файл | назначение |
 |---|---|

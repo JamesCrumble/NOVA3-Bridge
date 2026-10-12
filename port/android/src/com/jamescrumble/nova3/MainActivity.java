@@ -1,4 +1,4 @@
-package com.eaprules.nova3;
+package com.jamescrumble.nova3;
 
 import android.Manifest;
 import android.app.Activity;
