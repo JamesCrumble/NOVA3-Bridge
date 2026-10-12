@@ -74,6 +74,8 @@ public final class SettingsActivity extends Activity {
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
+        String exported = SaveMigration.exportIfOldInstall(this);
+        if (exported != null) android.widget.Toast.makeText(this, exported, android.widget.Toast.LENGTH_LONG).show();
         dp = getResources().getDisplayMetrics().density;
         values.putAll(load(this));
 

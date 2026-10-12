@@ -119,6 +119,8 @@ final class GameProcess {
 
     void start() throws Exception {
         stopStale();
+        String migrated = SaveMigration.importIfPresent(ctx);
+        if (migrated != null) appendLog("[wrapper] " + migrated);
         prepare();
         launch();
     }

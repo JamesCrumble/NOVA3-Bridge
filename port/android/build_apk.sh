@@ -60,6 +60,7 @@ cp android/build/sysroot.zip "$OUT/assets/sysroot.zip"
     --java "$OUT/gen" \
     --min-sdk-version 26 \
     --target-sdk-version 34 \
+    ${APP_ID:+--rename-manifest-package "$APP_ID"} \
     -o "$OUT/base.ap_" "$OUT/resources.zip"
 
 find "$OUT/gen" android/src -name '*.java' -print0 | xargs -0 javac \
@@ -96,6 +97,8 @@ else
         keytool -genkeypair -keystore "$KEY" -storepass android -keypass android             -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000             -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
     fi
     APK_OUT="$ROOT/NOVA3-ARM32-debug.apk"
+    # APP_ID=<old package name>: the same code under that name, to update an old install and export its saves.
+    [ -n "${APP_ID:-}" ] && APK_OUT="$ROOT/NOVA3-ARM32-debug-$APP_ID.apk"
     "$BT/zipalign" -f -p 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
     "$BT/apksigner" sign --ks "$KEY" --ks-pass pass:android --out "$APK_OUT" "$OUT/aligned.apk"
 fi
