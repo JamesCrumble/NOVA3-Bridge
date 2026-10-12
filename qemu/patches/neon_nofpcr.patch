@@ -1,0 +1,182 @@
+--- a/target/arm/tcg/vec_helper.c	2026-10-11 17:36:44.291531721 +0200
++++ b/target/arm/tcg/vec_helper.c	2026-10-11 17:36:44.295531781 +0200
+@@ -78,6 +78,126 @@
+ static inline float f32h(float32 x) { float f; memcpy(&f, &x, 4); return f; }
+ static inline float32 h32f(float f) { float32 x; memcpy(&x, &f, 4); return x; }
+ 
++#ifdef NOVA3_NEON_NOFPCR
++/*
++ * Variant without the FPCR switch (-DNOVA3_NEON_NOFPCR).
++ *
++ * Switching the host FPCR to FZ+DN costs a serialising MSR on entry and another
++ * when scalar VFP code runs next, and guest code that mixes the two - a Neon
++ * routine called from VFP code - pays both on every call. Here the element is
++ * computed with the host FPCR left at its IEEE default, which gives the
++ * standard-FPSCR result whenever flush-to-zero and default-NaN have nothing to
++ * do: no operand is a denormal or a NaN, and no result (the product included,
++ * for multiply-accumulate) is a denormal. A result exactly at the smallest
++ * normal is also sent to softfloat, since Arm detects tininess before rounding
++ * and such a value may have been rounded up from below. An invalid operation on
++ * ordinary operands yields the default NaN on the host too. Everything else
++ * goes through neon_f32_std(), so the result is the same in every case.
++ */
++static inline bool f32_plain(float32 v)
++{
++    uint32_t m = float32_val(v) & 0x7fffffff;
++    return m == 0 || (m - 0x00800000u) <= 0x7f000000u;   /* zero, normal or infinity */
++}
++
++static inline bool f32_settled(float r)
++{
++    uint32_t m = float32_val(h32f(r)) & 0x7fffffff;
++    return (m - 1u) >= 0x00800000u;                      /* not in (0, smallest normal] */
++}
++
++static inline float hadd(float x, float y) { float r; asm("fadd %s0, %s1, %s2" : "=w"(r) : "w"(x), "w"(y)); return r; }
++static inline float hsub(float x, float y) { float r; asm("fsub %s0, %s1, %s2" : "=w"(r) : "w"(x), "w"(y)); return r; }
++static inline float hmul(float x, float y) { float r; asm("fmul %s0, %s1, %s2" : "=w"(r) : "w"(x), "w"(y)); return r; }
++
++enum { NF_ADD, NF_SUB, NF_MUL, NF_MLA, NF_MLS };
++#define NFK_gvec_fadd_s         NF_ADD
++#define NFK_gvec_fsub_s         NF_SUB
++#define NFK_gvec_fmul_s         NF_MUL
++#define NFK_gvec_fmla_nf_s      NF_MLA
++#define NFK_gvec_fmls_nf_s      NF_MLS
++#define NFK_gvec_fmul_idx_s     NF_MUL
++#define NFK_gvec_fmla_nf_idx_s  NF_MLA
++#define NFK_gvec_fmls_nf_idx_s  NF_MLS
++
++/* d = n op m, or d = d +- n * m (two rounded steps). False: take the softfloat path. */
++static inline __attribute__((always_inline)) bool
++neon_f32_host(int kind, float32 dd, float32 nn, float32 mm, float32 *out)
++{
++    float r;
++    if (unlikely(!(f32_plain(nn) && f32_plain(mm)))) {
++        return false;
++    }
++    switch (kind) {
++    case NF_ADD: r = hadd(f32h(nn), f32h(mm)); break;
++    case NF_SUB: r = hsub(f32h(nn), f32h(mm)); break;
++    case NF_MUL: r = hmul(f32h(nn), f32h(mm)); break;
++    default:
++        if (unlikely(!f32_plain(dd))) {
++            return false;
++        }
++        r = hmul(f32h(nn), f32h(mm));
++        if (unlikely(!f32_settled(r))) {
++            return false;
++        }
++        r = kind == NF_MLA ? hadd(f32h(dd), r) : hsub(f32h(dd), r);
++        break;
++    }
++    if (unlikely(!f32_settled(r))) {
++        return false;
++    }
++    *out = h32f(r);
++    return true;
++}
++
++/*
++ * The rare element: computed the way the switching variant computes every element, with the host
++ * FPCR set to FZ+DN for this one operation and put back. Not softfloat: its float32_* entry points
++ * take this build's host-FPU shortcut, which is not exact at the smallest normal.
++ */
++static float32 __attribute__((noinline))
++neon_f32_std(int kind, float32 dd, float32 nn, float32 mm)
++{
++    uint64_t old, v;
++    float r;
++    asm volatile("mrs %0, fpcr" : "=r"(old) : : "memory");
++    v = (old & ~(3ull << 22)) | (1ull << 24) | (1ull << 25);  /* RN, FZ, DN */
++    asm volatile("msr fpcr, %0" : : "r"(v) : "memory");
++    switch (kind) {
++    case NF_ADD: r = hadd(f32h(nn), f32h(mm)); break;
++    case NF_SUB: r = hsub(f32h(nn), f32h(mm)); break;
++    case NF_MUL: r = hmul(f32h(nn), f32h(mm)); break;
++    case NF_MLA: r = hadd(f32h(dd), hmul(f32h(nn), f32h(mm))); break;
++    default:     r = hsub(f32h(dd), hmul(f32h(nn), f32h(mm))); break;
++    }
++    asm volatile("msr fpcr, %0" : : "r"(old) : "memory");
++    return h32f(r);
++}
++
++#define FAST_3OP_S(NAME, ASM, SOFT)                                         \
++void HELPER(NAME)(void *vd, void *vn, void *vm,                             \
++                  float_status *stat, uint32_t desc)                        \
++{                                                                           \
++    intptr_t i, oprsz = simd_oprsz(desc);                                   \
++    float32 *d = vd, *n = vn, *m = vm;                                      \
++    if (neon_fast(stat)) {                                                  \
++        nova3_fpcr_default();                                               \
++        for (i = 0; i < oprsz / 4; i++) {                                   \
++            float32 r;                                                      \
++            if (likely(neon_f32_host(NFK_##NAME, d[i], n[i], m[i], &r))) {  \
++                d[i] = r;                                                   \
++            } else {                                                        \
++                d[i] = neon_f32_std(NFK_##NAME, d[i], n[i], m[i]);          \
++            }                                                               \
++        }                                                                   \
++    } else {                                                                \
++        for (i = 0; i < oprsz / 4; i++) {                                   \
++            d[i] = SOFT;                                                    \
++        }                                                                   \
++    }                                                                       \
++    clear_tail(d, oprsz, simd_maxsz(desc));                                 \
++}
++#else
+ /* Element-wise d = f(n, m) or d = f(d, n, m); ASM operands: r out, x n, y m, a old d. */
+ #define FAST_3OP_S(NAME, ASM, SOFT)                                         \
+ void HELPER(NAME)(void *vd, void *vn, void *vm,                             \
+@@ -100,6 +220,7 @@
+     }                                                                       \
+     clear_tail(d, oprsz, simd_maxsz(desc));                                 \
+ }
++#endif /* NOVA3_NEON_NOFPCR */
+ #endif
+ 
+ /*
+@@ -1833,6 +1954,36 @@
+  * Any other status (A64 Neon, QEMU_STRICT_FP=1) takes the softfloat loop.
+  */
+ #if defined(__aarch64__)
++#ifdef NOVA3_NEON_NOFPCR
++#define FAST_IDX_S(NAME, ASM, SOFT)                                         \
++void HELPER(NAME)(void *vd, void *vn, void *vm,                             \
++                  float_status *stat, uint32_t desc)                        \
++{                                                                           \
++    intptr_t i, j, oprsz = simd_oprsz(desc);                                \
++    intptr_t segment = MIN(16, oprsz) / 4;                                  \
++    intptr_t idx = simd_data(desc);                                         \
++    float32 *d = vd, *n = vn, *m = vm;                                      \
++    const bool fast = neon_fast(stat);                                      \
++    if (fast) {                                                             \
++        nova3_fpcr_default();                                               \
++    }                                                                       \
++    for (i = 0; i < oprsz / 4; i += segment) {                              \
++        float32 mm = m[H4(i + idx)];                                        \
++        for (j = 0; j < segment; j++) {                                     \
++            float32 r;                                                      \
++            if (!fast) {                                                    \
++                d[i + j] = SOFT;                                            \
++            } else if (likely(neon_f32_host(NFK_##NAME, d[i + j],           \
++                                            n[i + j], mm, &r))) {           \
++                d[i + j] = r;                                               \
++            } else {                                                        \
++                d[i + j] = neon_f32_std(NFK_##NAME, d[i + j], n[i + j], mm);\
++            }                                                               \
++        }                                                                   \
++    }                                                                       \
++    clear_tail(d, oprsz, simd_maxsz(desc));                                 \
++}
++#else
+ /* d op= n * m[idx] per 128-bit segment; OP is the asm body on r (out), x (n), y (scalar), a (old d). */
+ #define FAST_IDX_S(NAME, ASM, SOFT)                                         \
+ void HELPER(NAME)(void *vd, void *vn, void *vm,                             \
+@@ -1863,6 +2014,7 @@
+     }                                                                       \
+     clear_tail(d, oprsz, simd_maxsz(desc));                                 \
+ }
++#endif /* NOVA3_NEON_NOFPCR */
+ 
+ FAST_IDX_S(gvec_fmul_idx_s, "fmul %s0, %s1, %s2",
+            float32_mul(n[i + j], mm, stat))

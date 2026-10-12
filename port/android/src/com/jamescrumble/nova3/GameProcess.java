@@ -351,7 +351,10 @@ final class GameProcess {
         appendLog("[wrapper] " + b.command());
         process = b.start();
         final Process p = process;
-        perf.start(p, "1".equals(SettingsActivity.load(ctx).get("PERF_HINT")));
+        int fpsLimit = 60;
+        try { fpsLimit = Integer.parseInt(SettingsActivity.load(ctx).getOrDefault("FPS_LIMIT", "60")); } catch (NumberFormatException ignored) { }
+        gl.setFrameLimit(fpsLimit);
+        perf.start(p, "1".equals(SettingsActivity.load(ctx).get("PERF_HINT")), fpsLimit);
         new Thread(this::writerLoop, "nova3-commands").start();
         new Thread(this::audioLoop, "nova3-audio").start();
         new Thread(() -> {

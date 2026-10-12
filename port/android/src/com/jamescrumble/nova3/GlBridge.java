@@ -819,6 +819,29 @@ final class GlBridge implements Runnable {
         }
     }
 
+    /** FPS_LIMIT: 0 = none. Frames are held back to this period; the game is paced by the frame acks. */
+    private volatile long frameNs;
+    private long nextFrameAt;
+
+    void setFrameLimit(int fps) {
+        // 6% short of the period: when the panel runs at the same rate vsync does the pacing, and this only
+        // holds the game back when the panel is faster than the limit (30 fps on a 60 or 120 Hz mode).
+        frameNs = fps > 0 ? 940_000_000L / fps : 0;
+    }
+
+    private void pace() {
+        long ns = frameNs;
+        if (ns <= 0) return;
+        long now = System.nanoTime();
+        long target = nextFrameAt + ns;
+        if (target > now && target - now <= ns) {
+            try { Thread.sleep((target - now) / 1_000_000L, (int) ((target - now) % 1_000_000L)); } catch (InterruptedException ignored) { }
+            nextFrameAt = target;
+        } else {
+            nextFrameAt = now;
+        }
+    }
+
     private void swap() {
         Surface s;
         boolean dirty;
@@ -830,6 +853,7 @@ final class GlBridge implements Runnable {
         if (dirty) attach(s);
 
         if (window != EGL14.EGL_NO_SURFACE) {
+            pace();
             if (!EGL14.eglSwapBuffers(dpy, window)) {
                 log.log("eglSwapBuffers failed: 0x" + Integer.toHexString(EGL14.eglGetError()));
                 EGL14.eglMakeCurrent(dpy, pbuf, pbuf, ctx);

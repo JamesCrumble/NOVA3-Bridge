@@ -22,7 +22,7 @@ import java.util.regex.Pattern;
 final class PerfHint {
     interface Log { void log(String s); }
 
-    private static final long TARGET_NS = 16_666_667L;
+    private long targetNs = 16_666_667L;
 
     private final Context ctx;
     private final Log log;
@@ -54,7 +54,12 @@ final class PerfHint {
      * of what it is for: qemu's main thread, alone of all threads, ended up with uclamp.max 171 of 1024 and
      * sat at the lowest clock while fully loaded.
      */
-    void start(Process p, boolean hints) {
+    /**
+     * The target has to be the rate the game is aiming for: with a fixed 60 fps target and a higher limit the
+     * system reads the shorter frames as headroom and clocks the cores down.
+     */
+    void start(Process p, boolean hints, int fpsLimit) {
+        if (fpsLimit >= 15 && fpsLimit <= 240) targetNs = 1_000_000_000L / fpsLimit;
         pid = pidOf(p);
         if (Build.VERSION.SDK_INT < 31 || !hints) {
             log.log("perf hint: off");
@@ -109,7 +114,7 @@ final class PerfHint {
                 ((PerformanceHintManager.Session) s).setThreads(tids);
             } else {
                 if (s != null) ((PerformanceHintManager.Session) s).close();
-                session = m.createHintSession(tids, TARGET_NS);
+                session = m.createHintSession(tids, targetNs);
                 // Android 15: do not trade this session's speed for power (API 35, so by reflection).
                 if (session != null && Build.VERSION.SDK_INT >= 35) {
                     try {
@@ -119,7 +124,7 @@ final class PerfHint {
                     }
                 }
             }
-            log.log("perf hint: session over " + tids.length + " qemu threads: " + (session != null ? "ok" : "refused")
+            log.log("perf hint: session over " + tids.length + " qemu threads: " + (session != null ? "ok" : "refused") + ", target " + targetNs + " ns"
                     + ", preferred rate " + m.getPreferredUpdateRateNanos() + " ns");
         } catch (RuntimeException e) {
             log.log("perf hint: " + e);
@@ -177,7 +182,7 @@ final class PerfHint {
             PerformanceHintManager.Session ss = (PerformanceHintManager.Session) s;
             ss.reportActualWorkDuration(d);
             // Frames well over target: say the load just went up (API 33), at most twice a second.
-            if (Build.VERSION.SDK_INT >= 33 && d > TARGET_NS + TARGET_NS / 4 && now - lastLoadUp > 500_000_000L) {
+            if (Build.VERSION.SDK_INT >= 33 && d > targetNs + targetNs / 4 && now - lastLoadUp > 500_000_000L) {
                 lastLoadUp = now;
                 loadUp(ss);
             }

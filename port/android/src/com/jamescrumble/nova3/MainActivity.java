@@ -55,9 +55,25 @@ public final class MainActivity extends Activity {
     private volatile int modeEpoch;
     private volatile long loadingSince;
 
+    private boolean showFps = true;
+    private int fpsLimit = 60;
+
+    /** Tells the compositor how fast this surface is meant to be drawn (API 30+). */
+    private void setRate(android.view.Surface surf) {
+        if (Build.VERSION.SDK_INT >= 30 && surf != null && surf.isValid()) {
+            try { surf.setFrameRate(fpsLimit, android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT); } catch (RuntimeException ignored) { }
+        }
+    }
+
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
+        showFps = !"0".equals(SettingsActivity.load(this).get("FPS_COUNTER"));
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // The menu's frame-rate limit also asks the panel for that refresh rate (the system picks the nearest mode).
+        try { fpsLimit = Integer.parseInt(SettingsActivity.load(this).getOrDefault("FPS_LIMIT", "60")); } catch (NumberFormatException ignored) { }
+        WindowManager.LayoutParams wlp = getWindow().getAttributes();
+        wlp.preferredRefreshRate = fpsLimit;
+        getWindow().setAttributes(wlp);
         if (Build.VERSION.SDK_INT >= 28) {
             getWindow().getAttributes().layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
@@ -88,8 +104,8 @@ public final class MainActivity extends Activity {
         // The game renders at its own size and the compositor scales it to the panel.
         holder.setFixedSize(game.renderWidth(), game.renderHeight());
         holder.addCallback(new SurfaceHolder.Callback() {
-            @Override public void surfaceCreated(SurfaceHolder h) { game.gl().setSurface(h.getSurface()); }
-            @Override public void surfaceChanged(SurfaceHolder h, int format, int w, int hgt) { game.gl().setSurface(h.getSurface()); }
+            @Override public void surfaceCreated(SurfaceHolder h) { setRate(h.getSurface()); game.gl().setSurface(h.getSurface()); }
+            @Override public void surfaceChanged(SurfaceHolder h, int format, int w, int hgt) { setRate(h.getSurface()); game.gl().setSurface(h.getSurface()); }
             @Override public void surfaceDestroyed(SurfaceHolder h) { game.gl().setSurface(null); }
         });
         root.addView(glView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -141,7 +157,7 @@ public final class MainActivity extends Activity {
         @Override public void run() {
             Phase p = phase;
             long t = SystemClock.uptimeMillis();
-            if (p == Phase.PLAYING && t - fpsAt >= 500) {
+            if (showFps && p == Phase.PLAYING && t - fpsAt >= 500) {
                 long s = game.gl().swaps();
                 fpsText = String.format(Locale.US, "%.1f FPS", (s - fpsSwaps) * 1000.0 / (t - fpsAt));
                 fpsSwaps = s;
@@ -358,7 +374,7 @@ public final class MainActivity extends Activity {
             if (p == Phase.PLAYING) {
                 // In phone mode the engine draws its own controls.
                 if (!menuMode && (!game.touchMode() || padOn)) drawButtons(c);
-                drawFps(c);
+                if (showFps) drawFps(c);
             } else {
                 drawLoading(c, p, SystemClock.uptimeMillis());
             }

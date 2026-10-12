@@ -1,0 +1,1068 @@
+--- a/target/arm/tcg/translate.c
++++ b/target/arm/tcg/translate.c
+@@ -30,6 +30,8 @@
+ #include "cpregs.h"
+ #include "exec/target_page.h"
+ #include "exec/translator.h"
++#include "exec/translation-block.h"
++#include "accel/tcg/tb-jmp-cache.h"
+ #include "helper.h"
+ #include "helper-mve.h"
+ 
+@@ -353,6 +355,24 @@
+ 
+ void gen_set_cpsr(TCGv_i32 var, uint32_t mask)
+ {
++    /*
++     * SHADOWGUN build: the condition flags (VMRS APSR_nzcv, FPSCR after every VCMP; MSR APSR_nzcv[q]) are
++     * four TCG globals, so write them inline instead of calling cpsr_write() - it was ~11% of the engine
++     * thread in a simpleperf profile. Same assignments as cpsr_write(): ZF is zero when Z is set.
++     */
++    if (mask == CPSR_NZCV || mask == (CPSR_NZCV | CPSR_Q)) {
++        tcg_gen_mov_i32(cpu_NF, var);
++        tcg_gen_extract_i32(cpu_CF, var, 29, 1);
++        tcg_gen_shli_i32(cpu_VF, var, 3);
++        tcg_gen_extract_i32(cpu_ZF, var, 30, 1);
++        tcg_gen_xori_i32(cpu_ZF, cpu_ZF, 1);
++        if (mask & CPSR_Q) {
++            TCGv_i32 q = tcg_temp_new_i32();
++            tcg_gen_extract_i32(q, var, 27, 1);
++            tcg_gen_st_i32(q, tcg_env, offsetof(CPUARMState, QF));
++        }
++        return;
++    }
+     gen_helper_cpsr_write(tcg_env, var, tcg_constant_i32(mask));
+ }
+ 
+@@ -1307,11 +1327,83 @@
+     }
+ }
+ 
+-static void gen_goto_ptr(void)
++#if defined(NOVA3_FAST_LOOKUP) && defined(CONFIG_USER_ONLY)
++/*
++ * SHADOWGUN build: the jump-cache probe of helper_arm_lookup_tb_ptr, emitted inline for an indirect jump
++ * (bx lr, ldr pc, pop {pc}, blx reg) taken from A32 ARM state. Simpleperf put that helper at ~25% of the
++ * engine thread: a call, ~30 instructions to rebuild the TB flags from env, the register zeroing on return.
++ *
++ * The flags of a TB can only differ from the current TB's if something changed them inside it, and every
++ * instruction that does (VMSR of FPSCR/FPEXC, CPSR mode writes) ends the TB without this path - except the
++ * Thumb bit, which a BX changes and is therefore tested dynamically. So the probe compares the cached TB
++ * against the current TB's own cs_base/flags/cflags, as constants. Any miss falls through to the helper,
++ * which stays the reference. Only plain TBs (no icount, single-step, last-io, pc-relative...) use it.
++ */
++static void gen_goto_ptr_inline(DisasContext *s)
++{
++    TranslationBlock *tb = s->base.tb;
++    TCGLabel *slow = gen_new_label();
++    TCGv_i32 pc = tcg_temp_new_i32();
++    TCGv_i32 t32 = tcg_temp_new_i32();
++    TCGv_i64 t64 = tcg_temp_new_i64();
++    TCGv_i64 pc64 = tcg_temp_new_i64();
++    TCGv_ptr jc = tcg_temp_new_ptr();
++    TCGv_ptr ent = tcg_temp_new_ptr();
++    TCGv_ptr off = tcg_temp_new_ptr();
++    TCGv_ptr tbp = tcg_temp_new_ptr();
++
++    tcg_gen_ld_i32(t32, tcg_env, offsetof(CPUARMState, thumb));
++    tcg_gen_brcondi_i32(TCG_COND_NE, t32, 0, slow);
++
++    tcg_gen_mov_i32(pc, cpu_R[15]);
++    tcg_gen_extu_i32_i64(pc64, pc);
++    tcg_gen_shri_i32(t32, pc, TB_JMP_CACHE_BITS);
++    tcg_gen_xor_i32(t32, t32, pc);
++    tcg_gen_andi_i32(t32, t32, TB_JMP_CACHE_SIZE - 1);
++    QEMU_BUILD_BUG_ON(sizeof(((CPUJumpCache *)0)->array[0]) != 32);
++    tcg_gen_shli_i32(t32, t32, 5);                       /* entries are 32 bytes: { tb, pc, key, ptr } */
++    tcg_gen_ext_i32_ptr(off, t32);
++    tcg_gen_ld_ptr(jc, tcg_env, offsetof(CPUState, tb_jmp_cache) - offsetof(ArchCPU, env));
++    tcg_gen_add_ptr(ent, jc, off);
++
++    tcg_gen_ld_ptr(tbp, ent, offsetof(CPUJumpCache, array[0].tb));
++    tcg_gen_brcondi_ptr(TCG_COND_EQ, tbp, 0, slow);
++    tcg_gen_ld_i64(t64, ent, offsetof(CPUJumpCache, array[0].pc));
++    tcg_gen_brcond_i64(TCG_COND_NE, t64, pc64, slow);
++    tcg_gen_ld_i64(t64, tbp, offsetof(TranslationBlock, cs_base));
++    tcg_gen_brcondi_i64(TCG_COND_NE, t64, tb->cs_base, slow);
++    tcg_gen_ld_i32(t32, tbp, offsetof(TranslationBlock, flags));
++    tcg_gen_brcondi_i32(TCG_COND_NE, t32, tb->flags, slow);
++    tcg_gen_ld_i32(t32, tbp, offsetof(TranslationBlock, cflags));
++    tcg_gen_brcondi_i32(TCG_COND_NE, t32, tb_cflags(tb), slow);
++
++    tcg_gen_ld_ptr(tbp, tbp, offsetof(TranslationBlock, tc.ptr));
++    tcg_gen_movi_i32(t32, 1);
++    tcg_gen_st8_i32(t32, tcg_env, offsetof(CPUState, neg.can_do_io) - offsetof(ArchCPU, env));
++    tcg_gen_goto_ptr_val(tbp);
++
++    gen_set_label(slow);
++}
++#endif
++
++static bool inline_lookup_on;
++
++static void __attribute__((constructor)) inline_lookup_init(void)
++{
++    const char *v = getenv("SHADOWGUN_INLINE_LOOKUP");
++    inline_lookup_on = v && *v && *v != '0';
++}
++
++static void gen_goto_ptr(DisasContext *s, bool indirect)
+ {
+ #if defined(NOVA3_FAST_LOOKUP) && defined(CONFIG_USER_ONLY)
+     /* NOVA3 Android build: A32 lookup with the flags built inline (op_helper.c). */
+     if (!(tcg_ctx->gen_tb->cflags & CF_NO_GOTO_PTR)) {
++        if (inline_lookup_on && indirect && !s->thumb && !s->condexec_mask && !s->ss_active &&
++            !(tb_cflags(s->base.tb) & ~(CF_PARALLEL | CF_CLUSTER_MASK)) &&
++            !arm_dc_feature(s, ARM_FEATURE_M)) {
++            gen_goto_ptr_inline(s);
++        }
+         TCGv_ptr ptr = tcg_temp_new_ptr();
+         gen_helper_arm_lookup_tb_ptr(ptr, tcg_env);
+         tcg_gen_goto_ptr_val(ptr);
+@@ -1346,7 +1438,7 @@
+         tcg_gen_exit_tb(s->base.tb, tb_slot_idx);
+     } else {
+         gen_update_pc(s, diff);
+-        gen_goto_ptr();
++        gen_goto_ptr(s, false);
+     }
+     s->base.is_jmp = DISAS_NORETURN;
+ }
+@@ -1383,7 +1475,7 @@
+          * and don't chain to another TB.
+          */
+         gen_update_pc(s, diff);
+-        gen_goto_ptr();
++        gen_goto_ptr(s, false);
+         s->base.is_jmp = DISAS_NORETURN;
+         break;
+     default:
+@@ -6445,6 +6537,14 @@
+         dc->ns = EX_TBFLAG_A32(tb_flags, NS);
+         dc->vfp_enabled = EX_TBFLAG_A32(tb_flags, VFPEN);
+         dc->vec_len = EX_TBFLAG_A32(tb_flags, VECLEN);
++        {
++            static int inline_fp = -1;
++            if (unlikely(inline_fp < 0)) {
++                const char *v = getenv("QEMU_STRICT_FP"), *w = getenv("SHADOWGUN_INLINE_FP");
++                inline_fp = !(v && *v && *v != '0') && !(w && *w == '0');
++            }
++            dc->fastfp = inline_fp && EX_TBFLAG_A32(tb_flags, FASTFP);
++        }
+         dc->vec_stride = EX_TBFLAG_A32(tb_flags, VECSTRIDE);
+         dc->sme_trap_nonstreaming =
+             EX_TBFLAG_A32(tb_flags, SME_TRAP_NONSTREAMING);
+@@ -6895,7 +6995,7 @@
+             gen_update_pc(dc, curr_insn_len(dc));
+             /* fall through */
+         case DISAS_JUMP:
+-            gen_goto_ptr();
++            gen_goto_ptr(dc, dc->base.is_jmp == DISAS_JUMP);
+             break;
+         case DISAS_UPDATE_EXIT:
+             gen_update_pc(dc, curr_insn_len(dc));
+--- a/target/arm/tcg/translate-vfp.c
++++ b/target/arm/tcg/translate-vfp.c
+@@ -295,8 +295,45 @@
+  * The most usual kind of VFP access check, for everything except
+  * FMXR/FMRX to the always-available special registers.
+  */
++/*
++ * Shadowgun: scalar add/sub/mul/div as host instructions when the TB was translated for plain IEEE
++ * FPSCR (TBFLAG_A32.FASTFP). Same results as the helpers' host-FPU shortcut, minus the call; as there,
++ * the cumulative exception flags are not produced. vfp_access_check() latches the TB's answer.
++ */
++static __thread bool sg_fastfp;
++
++#ifdef __aarch64__
++#define SG_HF(NAME, OPC, T, W)                                              \
++static void sg_##NAME(TCGv_##T d, TCGv_##T a, TCGv_##T b, TCGv_ptr fpst)    \
++{                                                                           \
++    if (sg_fastfp) {                                                        \
++        tcg_gen_hfop_##T(OPC, d, a, b);                                     \
++    } else {                                                                \
++        gen_helper_##NAME(d, a, b, fpst);                                   \
++    }                                                                       \
++}
++SG_HF(vfp_adds, INDEX_op_hfadd, i32, s)
++SG_HF(vfp_subs, INDEX_op_hfsub, i32, s)
++SG_HF(vfp_muls, INDEX_op_hfmul, i32, s)
++SG_HF(vfp_divs, INDEX_op_hfdiv, i32, s)
++SG_HF(vfp_addd, INDEX_op_hfadd, i64, d)
++SG_HF(vfp_subd, INDEX_op_hfsub, i64, d)
++SG_HF(vfp_muld, INDEX_op_hfmul, i64, d)
++SG_HF(vfp_divd, INDEX_op_hfdiv, i64, d)
++#undef SG_HF
++#define gen_helper_vfp_adds sg_vfp_adds
++#define gen_helper_vfp_subs sg_vfp_subs
++#define gen_helper_vfp_muls sg_vfp_muls
++#define gen_helper_vfp_divs sg_vfp_divs
++#define gen_helper_vfp_addd sg_vfp_addd
++#define gen_helper_vfp_subd sg_vfp_subd
++#define gen_helper_vfp_muld sg_vfp_muld
++#define gen_helper_vfp_divd sg_vfp_divd
++#endif
++
+ bool vfp_access_check(DisasContext *s)
+ {
++    sg_fastfp = s->fastfp;
+     if (arm_dc_feature(s, ARM_FEATURE_M)) {
+         return vfp_access_check_m(s, false);
+     } else {
+@@ -2496,6 +2533,50 @@
+     return true;
+ }
+ 
++/*
++ * SHADOWGUN build: VCMP/VCMPE.F32 as plain TCG ops. The relation is read off the bit patterns (sign-magnitude to
++ * two's complement: -0 == +0, denormals compare exactly, as without flush-to-zero) and written to FPSCR[31:28]
++ * with no helper call - a call cost more than the compare itself. The cumulative flags (IOC for a NaN) are not
++ * produced, like the other fast VFP paths; QEMU_STRICT_FP=1 keeps the softfloat helpers. Guests that set
++ * FPSCR.FZ would differ on denormal inputs (this game does not).
++ */
++static bool vcmp_inline_ok = true;
++
++static void __attribute__((constructor)) vcmp_inline_init(void)
++{
++    const char *v = getenv("QEMU_STRICT_FP");
++    vcmp_inline_ok = !(v && *v && *v != '0');
++}
++
++static void gen_vcmp_s_inline(TCGv_i32 a, TCGv_i32 b)
++{
++    TCGv_i32 aa = tcg_temp_new_i32(), ab = tcg_temp_new_i32();
++    TCGv_i32 ka = tcg_temp_new_i32(), kb = tcg_temp_new_i32();
++    TCGv_i32 t = tcg_temp_new_i32(), f = tcg_temp_new_i32(), u = tcg_temp_new_i32();
++    TCGv_i32 zero = tcg_constant_i32(0);
++
++    tcg_gen_andi_i32(aa, a, 0x7fffffff);
++    tcg_gen_andi_i32(ab, b, 0x7fffffff);
++    tcg_gen_neg_i32(t, aa);
++    tcg_gen_movcond_i32(TCG_COND_LT, ka, a, zero, t, aa);
++    tcg_gen_neg_i32(t, ab);
++    tcg_gen_movcond_i32(TCG_COND_LT, kb, b, zero, t, ab);
++
++    tcg_gen_movi_i32(f, 0x2);                                       /* greater */
++    tcg_gen_movcond_i32(TCG_COND_LT, f, ka, kb, tcg_constant_i32(0x8), f);
++    tcg_gen_movcond_i32(TCG_COND_EQ, f, ka, kb, tcg_constant_i32(0x6), f);
++    tcg_gen_setcondi_i32(TCG_COND_GTU, u, aa, 0x7f800000);          /* either a NaN: unordered */
++    tcg_gen_setcondi_i32(TCG_COND_GTU, t, ab, 0x7f800000);
++    tcg_gen_or_i32(u, u, t);
++    tcg_gen_movcond_i32(TCG_COND_NE, f, u, zero, tcg_constant_i32(0x3), f);
++
++    tcg_gen_shli_i32(f, f, 28);
++    tcg_gen_ld_i32(t, tcg_env, offsetoflow32(CPUARMState, vfp.fpsr));
++    tcg_gen_andi_i32(t, t, 0x0fffffff);
++    tcg_gen_or_i32(t, t, f);
++    tcg_gen_st_i32(t, tcg_env, offsetoflow32(CPUARMState, vfp.fpsr));
++}
++
+ static bool trans_VCMP_sp(DisasContext *s, arg_VCMP_sp *a)
+ {
+     TCGv_i32 vd, vm;
+@@ -2523,7 +2604,9 @@
+         vfp_load_reg32(vm, a->vm);
+     }
+ 
+-    if (a->e) {
++    if (vcmp_inline_ok) {
++        gen_vcmp_s_inline(vd, vm);
++    } else if (a->e) {
+         gen_helper_vfp_cmpes(vd, vm, tcg_env);
+     } else {
+         gen_helper_vfp_cmps(vd, vm, tcg_env);
+--- a/target/arm/tcg/vfp_helper.c
++++ b/target/arm/tcg/vfp_helper.c
+@@ -309,6 +309,14 @@
+     return float64_sqrt(a, fpst);
+ }
+ 
++static bool vfp_strict_fp;
++
++static void __attribute__((constructor)) vfp_strict_fp_init(void)
++{
++    const char *v = getenv("QEMU_STRICT_FP");
++    vfp_strict_fp = v && *v && *v != '0';
++}
++
+ static void softfloat_to_vfp_compare(CPUARMState *env, FloatRelation cmp)
+ {
+     uint32_t flags;
+@@ -344,10 +352,44 @@
+         FLOATTYPE ## _compare(a, b, &env->vfp.fp_status[FPST])); \
+ }
+ DO_VFP_cmp(h, float16, dh_ctype_f16, FPST_A32_F16)
+-DO_VFP_cmp(s, float32, float32, FPST_A32)
+ DO_VFP_cmp(d, float64, float64, FPST_A32)
+ #undef DO_VFP_cmp
+ 
++/*
++ * SHADOWGUN build: VCMP/VCMPE.F32 without softfloat. The relation is read straight off the bit patterns
++ * (sign-magnitude to two's complement, so -0 == +0 and denormals compare exactly, as without flush-to-zero),
++ * independent of the host FPCR. Like the other fast VFP paths the cumulative flags (IOC for a NaN) are not
++ * produced; flush-inputs-to-zero guests and QEMU_STRICT_FP=1 keep the softfloat path.
++ */
++static inline void vfp_cmp_s_fast(float32 a, float32 b, CPUARMState *env, bool exc)
++{
++    float_status *st = &env->vfp.fp_status[FPST_A32];
++    uint32_t flags;
++
++    if (unlikely(st->flush_inputs_to_zero) || unlikely(vfp_strict_fp)) {
++        softfloat_to_vfp_compare(env, exc ? float32_compare(a, b, st) : float32_compare_quiet(a, b, st));
++        return;
++    }
++    if (unlikely((a & 0x7fffffffu) > 0x7f800000u || (b & 0x7fffffffu) > 0x7f800000u)) {
++        flags = 0x3;                                        /* unordered */
++    } else {
++        int32_t ka = (a & 0x80000000u) ? -(int32_t)(a & 0x7fffffffu) : (int32_t)a;
++        int32_t kb = (b & 0x80000000u) ? -(int32_t)(b & 0x7fffffffu) : (int32_t)b;
++        flags = ka == kb ? 0x6 : ka < kb ? 0x8 : 0x2;
++    }
++    env->vfp.fpsr = deposit64(env->vfp.fpsr, 28, 4, flags); /* NZCV */
++}
++
++void VFP_HELPER(cmp, s)(float32 a, float32 b, CPUARMState *env)
++{
++    vfp_cmp_s_fast(a, b, env, false);
++}
++
++void VFP_HELPER(cmpe, s)(float32 a, float32 b, CPUARMState *env)
++{
++    vfp_cmp_s_fast(a, b, env, true);
++}
++
+ /* Integer to float and float to integer conversions */
+ 
+ #define CONV_ITOF(name, ftype, fsz, sign)                           \
+--- a/target/arm/tcg/helper-defs.h
++++ b/target/arm/tcg/helper-defs.h
+@@ -114,128 +114,128 @@
+ DEF_HELPER_1(vfp_get_fpscr, i32, env)
+ DEF_HELPER_2(vfp_set_fpscr, void, env, i32)
+ 
+-DEF_HELPER_3(vfp_addh, f16, f16, f16, fpst)
+-DEF_HELPER_3(vfp_adds, f32, f32, f32, fpst)
+-DEF_HELPER_3(vfp_addd, f64, f64, f64, fpst)
+-DEF_HELPER_3(vfp_subh, f16, f16, f16, fpst)
+-DEF_HELPER_3(vfp_subs, f32, f32, f32, fpst)
+-DEF_HELPER_3(vfp_subd, f64, f64, f64, fpst)
+-DEF_HELPER_3(vfp_mulh, f16, f16, f16, fpst)
+-DEF_HELPER_3(vfp_muls, f32, f32, f32, fpst)
+-DEF_HELPER_3(vfp_muld, f64, f64, f64, fpst)
+-DEF_HELPER_3(vfp_divh, f16, f16, f16, fpst)
+-DEF_HELPER_3(vfp_divs, f32, f32, f32, fpst)
+-DEF_HELPER_3(vfp_divd, f64, f64, f64, fpst)
+-DEF_HELPER_3(vfp_maxh, f16, f16, f16, fpst)
+-DEF_HELPER_3(vfp_maxs, f32, f32, f32, fpst)
+-DEF_HELPER_3(vfp_maxd, f64, f64, f64, fpst)
+-DEF_HELPER_3(vfp_minh, f16, f16, f16, fpst)
+-DEF_HELPER_3(vfp_mins, f32, f32, f32, fpst)
+-DEF_HELPER_3(vfp_mind, f64, f64, f64, fpst)
+-DEF_HELPER_3(vfp_maxnumh, f16, f16, f16, fpst)
+-DEF_HELPER_3(vfp_maxnums, f32, f32, f32, fpst)
+-DEF_HELPER_3(vfp_maxnumd, f64, f64, f64, fpst)
+-DEF_HELPER_3(vfp_minnumh, f16, f16, f16, fpst)
+-DEF_HELPER_3(vfp_minnums, f32, f32, f32, fpst)
+-DEF_HELPER_3(vfp_minnumd, f64, f64, f64, fpst)
+-DEF_HELPER_2(vfp_sqrth, f16, f16, fpst)
+-DEF_HELPER_2(vfp_sqrts, f32, f32, fpst)
+-DEF_HELPER_2(vfp_sqrtd, f64, f64, fpst)
+-DEF_HELPER_3(vfp_cmph, void, f16, f16, env)
+-DEF_HELPER_3(vfp_cmps, void, f32, f32, env)
+-DEF_HELPER_3(vfp_cmpd, void, f64, f64, env)
+-DEF_HELPER_3(vfp_cmpeh, void, f16, f16, env)
+-DEF_HELPER_3(vfp_cmpes, void, f32, f32, env)
+-DEF_HELPER_3(vfp_cmped, void, f64, f64, env)
++DEF_HELPER_FLAGS_3(vfp_addh, TCG_CALL_NO_RWG, f16, f16, f16, fpst)
++DEF_HELPER_FLAGS_3(vfp_adds, TCG_CALL_NO_RWG, f32, f32, f32, fpst)
++DEF_HELPER_FLAGS_3(vfp_addd, TCG_CALL_NO_RWG, f64, f64, f64, fpst)
++DEF_HELPER_FLAGS_3(vfp_subh, TCG_CALL_NO_RWG, f16, f16, f16, fpst)
++DEF_HELPER_FLAGS_3(vfp_subs, TCG_CALL_NO_RWG, f32, f32, f32, fpst)
++DEF_HELPER_FLAGS_3(vfp_subd, TCG_CALL_NO_RWG, f64, f64, f64, fpst)
++DEF_HELPER_FLAGS_3(vfp_mulh, TCG_CALL_NO_RWG, f16, f16, f16, fpst)
++DEF_HELPER_FLAGS_3(vfp_muls, TCG_CALL_NO_RWG, f32, f32, f32, fpst)
++DEF_HELPER_FLAGS_3(vfp_muld, TCG_CALL_NO_RWG, f64, f64, f64, fpst)
++DEF_HELPER_FLAGS_3(vfp_divh, TCG_CALL_NO_RWG, f16, f16, f16, fpst)
++DEF_HELPER_FLAGS_3(vfp_divs, TCG_CALL_NO_RWG, f32, f32, f32, fpst)
++DEF_HELPER_FLAGS_3(vfp_divd, TCG_CALL_NO_RWG, f64, f64, f64, fpst)
++DEF_HELPER_FLAGS_3(vfp_maxh, TCG_CALL_NO_RWG, f16, f16, f16, fpst)
++DEF_HELPER_FLAGS_3(vfp_maxs, TCG_CALL_NO_RWG, f32, f32, f32, fpst)
++DEF_HELPER_FLAGS_3(vfp_maxd, TCG_CALL_NO_RWG, f64, f64, f64, fpst)
++DEF_HELPER_FLAGS_3(vfp_minh, TCG_CALL_NO_RWG, f16, f16, f16, fpst)
++DEF_HELPER_FLAGS_3(vfp_mins, TCG_CALL_NO_RWG, f32, f32, f32, fpst)
++DEF_HELPER_FLAGS_3(vfp_mind, TCG_CALL_NO_RWG, f64, f64, f64, fpst)
++DEF_HELPER_FLAGS_3(vfp_maxnumh, TCG_CALL_NO_RWG, f16, f16, f16, fpst)
++DEF_HELPER_FLAGS_3(vfp_maxnums, TCG_CALL_NO_RWG, f32, f32, f32, fpst)
++DEF_HELPER_FLAGS_3(vfp_maxnumd, TCG_CALL_NO_RWG, f64, f64, f64, fpst)
++DEF_HELPER_FLAGS_3(vfp_minnumh, TCG_CALL_NO_RWG, f16, f16, f16, fpst)
++DEF_HELPER_FLAGS_3(vfp_minnums, TCG_CALL_NO_RWG, f32, f32, f32, fpst)
++DEF_HELPER_FLAGS_3(vfp_minnumd, TCG_CALL_NO_RWG, f64, f64, f64, fpst)
++DEF_HELPER_FLAGS_2(vfp_sqrth, TCG_CALL_NO_RWG, f16, f16, fpst)
++DEF_HELPER_FLAGS_2(vfp_sqrts, TCG_CALL_NO_RWG, f32, f32, fpst)
++DEF_HELPER_FLAGS_2(vfp_sqrtd, TCG_CALL_NO_RWG, f64, f64, fpst)
++DEF_HELPER_FLAGS_3(vfp_cmph, TCG_CALL_NO_RWG, void, f16, f16, env)
++DEF_HELPER_FLAGS_3(vfp_cmps, TCG_CALL_NO_RWG, void, f32, f32, env)
++DEF_HELPER_FLAGS_3(vfp_cmpd, TCG_CALL_NO_RWG, void, f64, f64, env)
++DEF_HELPER_FLAGS_3(vfp_cmpeh, TCG_CALL_NO_RWG, void, f16, f16, env)
++DEF_HELPER_FLAGS_3(vfp_cmpes, TCG_CALL_NO_RWG, void, f32, f32, env)
++DEF_HELPER_FLAGS_3(vfp_cmped, TCG_CALL_NO_RWG, void, f64, f64, env)
+ 
+-DEF_HELPER_2(vfp_fcvtds, f64, f32, fpst)
+-DEF_HELPER_2(vfp_fcvtsd, f32, f64, fpst)
++DEF_HELPER_FLAGS_2(vfp_fcvtds, TCG_CALL_NO_RWG, f64, f32, fpst)
++DEF_HELPER_FLAGS_2(vfp_fcvtsd, TCG_CALL_NO_RWG, f32, f64, fpst)
+ DEF_HELPER_FLAGS_2(bfcvt, TCG_CALL_NO_RWG, i32, f32, fpst)
+ DEF_HELPER_FLAGS_2(bfcvt_pair, TCG_CALL_NO_RWG, i32, i64, fpst)
+ 
+-DEF_HELPER_2(vfp_uitoh, f16, i32, fpst)
+-DEF_HELPER_2(vfp_uitos, f32, i32, fpst)
+-DEF_HELPER_2(vfp_uitod, f64, i32, fpst)
+-DEF_HELPER_2(vfp_sitoh, f16, i32, fpst)
+-DEF_HELPER_2(vfp_sitos, f32, i32, fpst)
+-DEF_HELPER_2(vfp_sitod, f64, i32, fpst)
+-
+-DEF_HELPER_2(vfp_touih, i32, f16, fpst)
+-DEF_HELPER_2(vfp_touis, i32, f32, fpst)
+-DEF_HELPER_2(vfp_touid, i32, f64, fpst)
+-DEF_HELPER_2(vfp_touizh, i32, f16, fpst)
+-DEF_HELPER_2(vfp_touizs, i32, f32, fpst)
+-DEF_HELPER_2(vfp_touizd, i32, f64, fpst)
+-DEF_HELPER_2(vfp_tosih, s32, f16, fpst)
+-DEF_HELPER_2(vfp_tosis, s32, f32, fpst)
+-DEF_HELPER_2(vfp_tosid, s32, f64, fpst)
+-DEF_HELPER_2(vfp_tosizh, s32, f16, fpst)
+-DEF_HELPER_2(vfp_tosizs, s32, f32, fpst)
+-DEF_HELPER_2(vfp_tosizd, s32, f64, fpst)
+-
+-DEF_HELPER_3(vfp_toshh_round_to_zero, i32, f16, i32, fpst)
+-DEF_HELPER_3(vfp_toslh_round_to_zero, i32, f16, i32, fpst)
+-DEF_HELPER_3(vfp_touhh_round_to_zero, i32, f16, i32, fpst)
+-DEF_HELPER_3(vfp_toulh_round_to_zero, i32, f16, i32, fpst)
+-DEF_HELPER_3(vfp_toshs_round_to_zero, i32, f32, i32, fpst)
+-DEF_HELPER_3(vfp_tosls_round_to_zero, i32, f32, i32, fpst)
+-DEF_HELPER_3(vfp_touhs_round_to_zero, i32, f32, i32, fpst)
+-DEF_HELPER_3(vfp_touls_round_to_zero, i32, f32, i32, fpst)
+-DEF_HELPER_3(vfp_toshd_round_to_zero, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_tosld_round_to_zero, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_tosqd_round_to_zero, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_touhd_round_to_zero, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_tould_round_to_zero, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_touqd_round_to_zero, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_touhh, i32, f16, i32, fpst)
+-DEF_HELPER_3(vfp_toshh, i32, f16, i32, fpst)
+-DEF_HELPER_3(vfp_toulh, i32, f16, i32, fpst)
+-DEF_HELPER_3(vfp_toslh, i32, f16, i32, fpst)
+-DEF_HELPER_3(vfp_touqh, i64, f16, i32, fpst)
+-DEF_HELPER_3(vfp_tosqh, i64, f16, i32, fpst)
+-DEF_HELPER_3(vfp_toshs, i32, f32, i32, fpst)
+-DEF_HELPER_3(vfp_tosls, i32, f32, i32, fpst)
+-DEF_HELPER_3(vfp_tosqs, i64, f32, i32, fpst)
+-DEF_HELPER_3(vfp_touhs, i32, f32, i32, fpst)
+-DEF_HELPER_3(vfp_touls, i32, f32, i32, fpst)
+-DEF_HELPER_3(vfp_touqs, i64, f32, i32, fpst)
+-DEF_HELPER_3(vfp_toshd, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_tosld, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_tosqd, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_touhd, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_tould, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_touqd, i64, f64, i32, fpst)
+-DEF_HELPER_3(vfp_shtos, f32, i32, i32, fpst)
+-DEF_HELPER_3(vfp_sltos, f32, i32, i32, fpst)
+-DEF_HELPER_3(vfp_sqtos, f32, i64, i32, fpst)
+-DEF_HELPER_3(vfp_uhtos, f32, i32, i32, fpst)
+-DEF_HELPER_3(vfp_ultos, f32, i32, i32, fpst)
+-DEF_HELPER_3(vfp_uqtos, f32, i64, i32, fpst)
+-DEF_HELPER_3(vfp_shtod, f64, i64, i32, fpst)
+-DEF_HELPER_3(vfp_sltod, f64, i64, i32, fpst)
+-DEF_HELPER_3(vfp_sqtod, f64, i64, i32, fpst)
+-DEF_HELPER_3(vfp_uhtod, f64, i64, i32, fpst)
+-DEF_HELPER_3(vfp_ultod, f64, i64, i32, fpst)
+-DEF_HELPER_3(vfp_uqtod, f64, i64, i32, fpst)
+-DEF_HELPER_3(vfp_shtoh, f16, i32, i32, fpst)
+-DEF_HELPER_3(vfp_uhtoh, f16, i32, i32, fpst)
+-DEF_HELPER_3(vfp_sltoh, f16, i32, i32, fpst)
+-DEF_HELPER_3(vfp_ultoh, f16, i32, i32, fpst)
+-DEF_HELPER_3(vfp_sqtoh, f16, i64, i32, fpst)
+-DEF_HELPER_3(vfp_uqtoh, f16, i64, i32, fpst)
+-
+-DEF_HELPER_3(vfp_shtos_round_to_nearest, f32, i32, i32, fpst)
+-DEF_HELPER_3(vfp_sltos_round_to_nearest, f32, i32, i32, fpst)
+-DEF_HELPER_3(vfp_uhtos_round_to_nearest, f32, i32, i32, fpst)
+-DEF_HELPER_3(vfp_ultos_round_to_nearest, f32, i32, i32, fpst)
+-DEF_HELPER_3(vfp_shtod_round_to_nearest, f64, i64, i32, fpst)
+-DEF_HELPER_3(vfp_sltod_round_to_nearest, f64, i64, i32, fpst)
+-DEF_HELPER_3(vfp_uhtod_round_to_nearest, f64, i64, i32, fpst)
+-DEF_HELPER_3(vfp_ultod_round_to_nearest, f64, i64, i32, fpst)
+-DEF_HELPER_3(vfp_shtoh_round_to_nearest, f16, i32, i32, fpst)
+-DEF_HELPER_3(vfp_uhtoh_round_to_nearest, f16, i32, i32, fpst)
+-DEF_HELPER_3(vfp_sltoh_round_to_nearest, f16, i32, i32, fpst)
+-DEF_HELPER_3(vfp_ultoh_round_to_nearest, f16, i32, i32, fpst)
++DEF_HELPER_FLAGS_2(vfp_uitoh, TCG_CALL_NO_RWG, f16, i32, fpst)
++DEF_HELPER_FLAGS_2(vfp_uitos, TCG_CALL_NO_RWG, f32, i32, fpst)
++DEF_HELPER_FLAGS_2(vfp_uitod, TCG_CALL_NO_RWG, f64, i32, fpst)
++DEF_HELPER_FLAGS_2(vfp_sitoh, TCG_CALL_NO_RWG, f16, i32, fpst)
++DEF_HELPER_FLAGS_2(vfp_sitos, TCG_CALL_NO_RWG, f32, i32, fpst)
++DEF_HELPER_FLAGS_2(vfp_sitod, TCG_CALL_NO_RWG, f64, i32, fpst)
++
++DEF_HELPER_FLAGS_2(vfp_touih, TCG_CALL_NO_RWG, i32, f16, fpst)
++DEF_HELPER_FLAGS_2(vfp_touis, TCG_CALL_NO_RWG, i32, f32, fpst)
++DEF_HELPER_FLAGS_2(vfp_touid, TCG_CALL_NO_RWG, i32, f64, fpst)
++DEF_HELPER_FLAGS_2(vfp_touizh, TCG_CALL_NO_RWG, i32, f16, fpst)
++DEF_HELPER_FLAGS_2(vfp_touizs, TCG_CALL_NO_RWG, i32, f32, fpst)
++DEF_HELPER_FLAGS_2(vfp_touizd, TCG_CALL_NO_RWG, i32, f64, fpst)
++DEF_HELPER_FLAGS_2(vfp_tosih, TCG_CALL_NO_RWG, s32, f16, fpst)
++DEF_HELPER_FLAGS_2(vfp_tosis, TCG_CALL_NO_RWG, s32, f32, fpst)
++DEF_HELPER_FLAGS_2(vfp_tosid, TCG_CALL_NO_RWG, s32, f64, fpst)
++DEF_HELPER_FLAGS_2(vfp_tosizh, TCG_CALL_NO_RWG, s32, f16, fpst)
++DEF_HELPER_FLAGS_2(vfp_tosizs, TCG_CALL_NO_RWG, s32, f32, fpst)
++DEF_HELPER_FLAGS_2(vfp_tosizd, TCG_CALL_NO_RWG, s32, f64, fpst)
++
++DEF_HELPER_FLAGS_3(vfp_toshh_round_to_zero, TCG_CALL_NO_RWG, i32, f16, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_toslh_round_to_zero, TCG_CALL_NO_RWG, i32, f16, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touhh_round_to_zero, TCG_CALL_NO_RWG, i32, f16, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_toulh_round_to_zero, TCG_CALL_NO_RWG, i32, f16, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_toshs_round_to_zero, TCG_CALL_NO_RWG, i32, f32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_tosls_round_to_zero, TCG_CALL_NO_RWG, i32, f32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touhs_round_to_zero, TCG_CALL_NO_RWG, i32, f32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touls_round_to_zero, TCG_CALL_NO_RWG, i32, f32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_toshd_round_to_zero, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_tosld_round_to_zero, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_tosqd_round_to_zero, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touhd_round_to_zero, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_tould_round_to_zero, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touqd_round_to_zero, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touhh, TCG_CALL_NO_RWG, i32, f16, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_toshh, TCG_CALL_NO_RWG, i32, f16, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_toulh, TCG_CALL_NO_RWG, i32, f16, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_toslh, TCG_CALL_NO_RWG, i32, f16, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touqh, TCG_CALL_NO_RWG, i64, f16, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_tosqh, TCG_CALL_NO_RWG, i64, f16, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_toshs, TCG_CALL_NO_RWG, i32, f32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_tosls, TCG_CALL_NO_RWG, i32, f32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_tosqs, TCG_CALL_NO_RWG, i64, f32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touhs, TCG_CALL_NO_RWG, i32, f32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touls, TCG_CALL_NO_RWG, i32, f32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touqs, TCG_CALL_NO_RWG, i64, f32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_toshd, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_tosld, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_tosqd, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touhd, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_tould, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_touqd, TCG_CALL_NO_RWG, i64, f64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_shtos, TCG_CALL_NO_RWG, f32, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_sltos, TCG_CALL_NO_RWG, f32, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_sqtos, TCG_CALL_NO_RWG, f32, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_uhtos, TCG_CALL_NO_RWG, f32, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_ultos, TCG_CALL_NO_RWG, f32, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_uqtos, TCG_CALL_NO_RWG, f32, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_shtod, TCG_CALL_NO_RWG, f64, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_sltod, TCG_CALL_NO_RWG, f64, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_sqtod, TCG_CALL_NO_RWG, f64, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_uhtod, TCG_CALL_NO_RWG, f64, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_ultod, TCG_CALL_NO_RWG, f64, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_uqtod, TCG_CALL_NO_RWG, f64, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_shtoh, TCG_CALL_NO_RWG, f16, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_uhtoh, TCG_CALL_NO_RWG, f16, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_sltoh, TCG_CALL_NO_RWG, f16, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_ultoh, TCG_CALL_NO_RWG, f16, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_sqtoh, TCG_CALL_NO_RWG, f16, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_uqtoh, TCG_CALL_NO_RWG, f16, i64, i32, fpst)
++
++DEF_HELPER_FLAGS_3(vfp_shtos_round_to_nearest, TCG_CALL_NO_RWG, f32, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_sltos_round_to_nearest, TCG_CALL_NO_RWG, f32, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_uhtos_round_to_nearest, TCG_CALL_NO_RWG, f32, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_ultos_round_to_nearest, TCG_CALL_NO_RWG, f32, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_shtod_round_to_nearest, TCG_CALL_NO_RWG, f64, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_sltod_round_to_nearest, TCG_CALL_NO_RWG, f64, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_uhtod_round_to_nearest, TCG_CALL_NO_RWG, f64, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_ultod_round_to_nearest, TCG_CALL_NO_RWG, f64, i64, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_shtoh_round_to_nearest, TCG_CALL_NO_RWG, f16, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_uhtoh_round_to_nearest, TCG_CALL_NO_RWG, f16, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_sltoh_round_to_nearest, TCG_CALL_NO_RWG, f16, i32, i32, fpst)
++DEF_HELPER_FLAGS_3(vfp_ultoh_round_to_nearest, TCG_CALL_NO_RWG, f16, i32, i32, fpst)
+ 
+ DEF_HELPER_FLAGS_2(set_rmode, TCG_CALL_NO_RWG, i32, i32, fpst)
+ 
+@@ -244,9 +244,9 @@
+ DEF_HELPER_FLAGS_3(vfp_fcvt_f16_to_f64, TCG_CALL_NO_RWG, f64, f16, fpst, i32)
+ DEF_HELPER_FLAGS_3(vfp_fcvt_f64_to_f16, TCG_CALL_NO_RWG, f16, f64, fpst, i32)
+ 
+-DEF_HELPER_4(vfp_muladdd, f64, f64, f64, f64, fpst)
+-DEF_HELPER_4(vfp_muladds, f32, f32, f32, f32, fpst)
+-DEF_HELPER_4(vfp_muladdh, f16, f16, f16, f16, fpst)
++DEF_HELPER_FLAGS_4(vfp_muladdd, TCG_CALL_NO_RWG, f64, f64, f64, f64, fpst)
++DEF_HELPER_FLAGS_4(vfp_muladds, TCG_CALL_NO_RWG, f32, f32, f32, f32, fpst)
++DEF_HELPER_FLAGS_4(vfp_muladdh, TCG_CALL_NO_RWG, f16, f16, f16, f16, fpst)
+ 
+ DEF_HELPER_FLAGS_2(recpe_f16, TCG_CALL_NO_RWG, f16, f16, fpst)
+ DEF_HELPER_FLAGS_2(recpe_f32, TCG_CALL_NO_RWG, f32, f32, fpst)
+--- a/accel/tcg/translator.c
++++ b/accel/tcg/translator.c
+@@ -115,8 +115,18 @@
+         return false;
+     }
+ 
++#if defined(CONFIG_USER_ONLY) || defined(NOVA3_FAST_LOOKUP)
++    /*
++     * SHADOWGUN build: user mode has one flat address space with no virtual-to-physical remapping, and
++     * tb_phys_invalidate() unlinks every incoming jump of a TB it drops, so a direct jump may chain to a TB on
++     * another page (QEMU's own targets did this until the check moved here). Without it every bl/b that crosses
++     * a 4 KiB boundary - most calls in a large C++ engine - went through lookup_tb_ptr instead of being chained.
++     */
++    return true;
++#else
+     /* Check for the dest on the same page as the start of the TB.  */
+     return translator_is_same_page(db, dest);
++#endif
+ }
+ 
+ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
+--- a/meson.build
++++ b/meson.build
+@@ -685,30 +685,11 @@
+ # Check further flags that make QEMU more robust against malicious parties
+ 
+ hardening_flags = [
+-    # Initialize all stack variables to zero. This makes
+-    # it harder to take advantage of uninitialized stack
+-    # data to drive exploits
+-    '-ftrivial-auto-var-init=zero',
+-    # Ensure GCC zero-initializes padding bits and trailing fields in
+-    # unions. This avoids potentially leaking host data into the guest
+-    # when we init a struct and copy it into guest memory.  GCC prior
+-    # to GCC 15 and clang don't have this, but they zero the padding
+-    # and trailing portions of a union by default.
+-    '-fzero-init-padding-bits=all',
++    # SHADOWGUN build: none of QEMU's anti-exploit flags (zero-init of every stack variable, zeroing of all
++    # call-used registers after every function return). The helpers run ~100M calls/s here and each return
++    # paid up to 16 extra MOVs; this build runs only our own game.
+ ]
+ 
+-# Zero out registers used during a function call
+-# upon its return. This makes it harder to assemble
+-# ROP gadgets into something usable
+-#
+-# NB: Clang 17 is broken and SEGVs
+-# https://github.com/llvm/llvm-project/issues/75168
+-if cc.compiles('extern struct { void (*cb)(void); } s; void f(void) { s.cb(); }',
+-               name: '-fzero-call-used-regs=used-gpr',
+-               args: ['-O2', '-fzero-call-used-regs=used-gpr'])
+-    hardening_flags += '-fzero-call-used-regs=used-gpr'
+-endif
+-
+ qemu_common_flags += hardening_flags
+ 
+ # Collect warning flags we want to set, sorted alphabetically
+--- a/include/fpu/softfloat.h
++++ b/include/fpu/softfloat.h
+@@ -1412,6 +1412,13 @@
+ 
+ static inline void nova3_fpcr_default(void)
+ {
++#ifdef NOVA3_NEON_NOFPCR
++    /*
++     * This variant never leaves the host FPCR switched (neon_f32_std() puts it back itself), so there is
++     * nothing to restore - and the thread-local read was the first instruction of every scalar VFP helper.
++     */
++    return;
++#endif
+     if (__builtin_expect(nova3_fpcr_std, 0)) {
+         __asm__ volatile("msr fpcr, %0" : : "r"(nova3_fpcr_default_val) : "memory");
+         nova3_fpcr_std = false;
+--- a/include/tcg/tcg-opc.h
++++ b/include/tcg/tcg-opc.h
+@@ -71,6 +71,11 @@
+ DEF(mulu2, 2, 2, 0, TCG_OPF_INT)
+ DEF(muluh, 1, 2, 0, TCG_OPF_INT)
+ DEF(nand, 1, 2, 0, TCG_OPF_INT)
++/* Shadowgun: host FP on integer-register bit patterns (I32 = single, I64 = double); aarch64 host only. */
++DEF(hfadd, 1, 2, 0, TCG_OPF_INT)
++DEF(hfsub, 1, 2, 0, TCG_OPF_INT)
++DEF(hfmul, 1, 2, 0, TCG_OPF_INT)
++DEF(hfdiv, 1, 2, 0, TCG_OPF_INT)
+ DEF(neg, 1, 1, 0, TCG_OPF_INT)
+ DEF(negsetcond, 1, 2, 1, TCG_OPF_INT)
+ DEF(nor, 1, 2, 0, TCG_OPF_INT)
+--- a/tcg/tcg.c
++++ b/tcg/tcg.c
+@@ -1191,6 +1191,12 @@
+     OUTOP(INDEX_op_mulu2, TCGOutOpMul2, outop_mulu2),
+     OUTOP(INDEX_op_muluh, TCGOutOpBinary, outop_muluh),
+     OUTOP(INDEX_op_nand, TCGOutOpBinary, outop_nand),
++#ifdef __aarch64__
++    OUTOP(INDEX_op_hfadd, TCGOutOpBinary, outop_hfadd),
++    OUTOP(INDEX_op_hfsub, TCGOutOpBinary, outop_hfsub),
++    OUTOP(INDEX_op_hfmul, TCGOutOpBinary, outop_hfmul),
++    OUTOP(INDEX_op_hfdiv, TCGOutOpBinary, outop_hfdiv),
++#endif
+     OUTOP(INDEX_op_neg, TCGOutOpUnary, outop_neg),
+     OUTOP(INDEX_op_negsetcond, TCGOutOpSetcond, outop_negsetcond),
+     OUTOP(INDEX_op_nor, TCGOutOpBinary, outop_nor),
+@@ -5504,6 +5510,10 @@
+     case INDEX_op_mulsh:
+     case INDEX_op_muluh:
+     case INDEX_op_nand:
++    case INDEX_op_hfadd:
++    case INDEX_op_hfsub:
++    case INDEX_op_hfmul:
++    case INDEX_op_hfdiv:
+     case INDEX_op_nor:
+     case INDEX_op_or:
+     case INDEX_op_orc:
+--- a/tcg/tcg-op.c
++++ b/tcg/tcg-op.c
+@@ -153,6 +153,17 @@
+                 tcgv_i64_arg(a2), tcgv_i64_arg(a3));
+ }
+ 
++/* Shadowgun: host FP ops (INDEX_op_hfadd/hfsub/hfmul/hfdiv), aarch64 host only. */
++void tcg_gen_hfop_i32(TCGOpcode opc, TCGv_i32 ret, TCGv_i32 a, TCGv_i32 b)
++{
++    tcg_gen_op3_i32(opc, ret, a, b);
++}
++
++void tcg_gen_hfop_i64(TCGOpcode opc, TCGv_i64 ret, TCGv_i64 a, TCGv_i64 b)
++{
++    tcg_gen_op3_i64(opc, ret, a, b);
++}
++
+ static void DNI tcg_gen_op3i_i32(TCGOpcode opc, TCGv_i32 a1,
+                                  TCGv_i32 a2, TCGArg a3)
+ {
+--- a/tcg/aarch64/tcg-target.c.inc
++++ b/tcg/aarch64/tcg-target.c.inc
+@@ -2353,6 +2353,36 @@
+     .base.static_constraint = C_NotImplemented,
+ };
+ 
++/*
++ * Shadowgun: one guest VFP add/sub/mul/div as the host's own instruction, on the bit patterns TCG holds
++ * in general registers: fmov in, the operation, fmov out. V30/V31 are reserved for this.
++ */
++static void tgen_hfop(TCGContext *s, TCGType type, uint32_t opc,
++                      TCGReg a0, TCGReg a1, TCGReg a2)
++{
++    uint32_t dbl = type == TCG_TYPE_I64;
++    uint32_t to_fp = dbl ? 0x9e670000 : 0x1e270000;
++    uint32_t to_gp = dbl ? 0x9e660000 : 0x1e260000;
++
++    tcg_out32(s, to_fp | a1 << 5 | 30);
++    tcg_out32(s, to_fp | a2 << 5 | 31);
++    tcg_out32(s, opc | dbl << 22 | 31 << 16 | 30 << 5 | 30);
++    tcg_out32(s, to_gp | 30 << 5 | a0);
++}
++
++#define HFOP(NAME, OPC) \
++static void tgen_##NAME(TCGContext *s, TCGType type, TCGReg a0, TCGReg a1, TCGReg a2) \
++{ tgen_hfop(s, type, OPC, a0, a1, a2); } \
++static const TCGOutOpBinary outop_##NAME = { \
++    .base.static_constraint = C_O1_I2(r, r, r), \
++    .out_rrr = tgen_##NAME, \
++};
++HFOP(hfadd, 0x1e202800)
++HFOP(hfsub, 0x1e203800)
++HFOP(hfmul, 0x1e200800)
++HFOP(hfdiv, 0x1e201800)
++#undef HFOP
++
+ static const TCGOutOpBinary outop_nor = {
+     .base.static_constraint = C_NotImplemented,
+ };
+@@ -3446,6 +3476,7 @@
+     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP1);
+     tcg_regset_set_reg(s->reserved_regs, TCG_REG_TMP2);
+     tcg_regset_set_reg(s->reserved_regs, TCG_VEC_TMP0);
++    tcg_regset_set_reg(s->reserved_regs, TCG_REG_V30); /* tgen_hfop */
+ }
+ 
+ /* Saving pairs: (X19, X20) .. (X27, X28), (X29(fp), X30(lr)).  */
+--- a/include/tcg/tcg-op-common.h
++++ b/include/tcg/tcg-op-common.h
+@@ -110,6 +110,8 @@
+ void tcg_gen_andc_i32(TCGv_i32 ret, TCGv_i32 arg1, TCGv_i32 arg2);
+ void tcg_gen_eqv_i32(TCGv_i32 ret, TCGv_i32 arg1, TCGv_i32 arg2);
+ void tcg_gen_nand_i32(TCGv_i32 ret, TCGv_i32 arg1, TCGv_i32 arg2);
++void tcg_gen_hfop_i32(TCGOpcode opc, TCGv_i32 ret, TCGv_i32 a, TCGv_i32 b);
++void tcg_gen_hfop_i64(TCGOpcode opc, TCGv_i64 ret, TCGv_i64 a, TCGv_i64 b);
+ void tcg_gen_nor_i32(TCGv_i32 ret, TCGv_i32 arg1, TCGv_i32 arg2);
+ void tcg_gen_orc_i32(TCGv_i32 ret, TCGv_i32 arg1, TCGv_i32 arg2);
+ void tcg_gen_clz_i32(TCGv_i32 ret, TCGv_i32 arg1, TCGv_i32 arg2);
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -2485,6 +2485,11 @@
+  */
+ FIELD(TBFLAG_A32, VECLEN, 0, 3)         /* Not cached. */
+ FIELD(TBFLAG_A32, VECSTRIDE, 3, 2)     /* Not cached. */
++/*
++ * Shadowgun: FPSCR asks for plain IEEE arithmetic (round to nearest, no flush-to-zero, no default NaN),
++ * so scalar VFP add/sub/mul/div may be emitted as host instructions. Not cached.
++ */
++FIELD(TBFLAG_A32, FASTFP, 5, 1)
+ FIELD(TBFLAG_A32, VFPEN, 7, 1)         /* Partially cached, minus FPEXC. */
+ FIELD(TBFLAG_A32, SCTLR__B, 8, 1)      /* Cannot overlap with SCTLR_B */
+ FIELD(TBFLAG_A32, HSTR_ACTIVE, 9, 1)
+@@ -2579,6 +2584,12 @@
+ #define EX_TBFLAG_ANY(IN, WHICH)   FIELD_EX32(IN.flags, TBFLAG_ANY, WHICH)
+ #define EX_TBFLAG_A64(IN, WHICH)   FIELD_EX64(IN.flags2, TBFLAG_A64, WHICH)
+ #define EX_TBFLAG_A32(IN, WHICH)   FIELD_EX32(IN.flags2, TBFLAG_A32, WHICH)
++
++static inline bool arm_a32_fastfp(CPUARMState *env)
++{
++    /* The control bits fp_status[FPST_A32] is set up from; one load on the indirect-branch lookup path. */
++    return (env->vfp.fpcr & (FPCR_RMODE_MASK | FPCR_FZ | FPCR_DN)) == 0;
++}
+ #define EX_TBFLAG_M32(IN, WHICH)   FIELD_EX32(IN.flags2, TBFLAG_M32, WHICH)
+ #define EX_TBFLAG_AM32(IN, WHICH)  FIELD_EX32(IN.flags2, TBFLAG_AM32, WHICH)
+ 
+--- a/target/arm/tcg/hflags.c
++++ b/target/arm/tcg/hflags.c
+@@ -724,6 +724,7 @@
+             /* Note that VECLEN+VECSTRIDE are RES0 for M-profile. */
+             DP_TBFLAG_A32(flags, VECLEN, env->vfp.vec_len);
+             DP_TBFLAG_A32(flags, VECSTRIDE, env->vfp.vec_stride);
++            DP_TBFLAG_A32(flags, FASTFP, arm_a32_fastfp(env));
+             if (env->vfp.xregs[ARM_VFP_FPEXC] & (1 << 30)) {
+                 DP_TBFLAG_A32(flags, VFPEN, 1);
+             }
+--- a/target/arm/tcg/op_helper.c
++++ b/target/arm/tcg/op_helper.c
+@@ -807,31 +807,31 @@
+     CPUState *cs = env_cpu(env);
+     CPUARMTBFlags flags = env->hflags;
+ 
++    /*
++     * Shadowgun: M-profile, gdb single-step and breakpoints are not tested here - this build runs one
++     * A-profile linux-user CPU with no gdbstub - and a hit is decided from the jump-cache entry alone
++     * (pc, key, ptr), without reading the TB. The TB's cflags are not compared: the CPU's cflags change
++     * only together with a tb_flush, and an invalidated TB is taken out of every jump cache.
++     */
+     if (likely(!EX_TBFLAG_ANY(flags, AARCH64_STATE) &&
+-               !EX_TBFLAG_ANY(flags, SS_ACTIVE) &&
+-               !arm_feature(env, ARM_FEATURE_M) &&
+-               !cpu_single_stepping(cs) &&
+-               QTAILQ_EMPTY(&cs->breakpoints))) {
++               !EX_TBFLAG_ANY(flags, SS_ACTIVE))) {
+         vaddr pc = env->regs[15];
+-        uint32_t cflags = cs->tcg_cflags;
+         CPUJumpCache *jc = cs->tb_jmp_cache;
+         unsigned h = (pc ^ (pc >> TB_JMP_CACHE_BITS)) & (TB_JMP_CACHE_SIZE - 1);
+-        TranslationBlock *tb;
+ 
+         DP_TBFLAG_A32(flags, VECLEN, env->vfp.vec_len);
+         DP_TBFLAG_A32(flags, VECSTRIDE, env->vfp.vec_stride);
++        DP_TBFLAG_A32(flags, FASTFP, arm_a32_fastfp(env));
+         if (env->vfp.xregs[ARM_VFP_FPEXC] & (1 << 30)) {
+             DP_TBFLAG_A32(flags, VFPEN, 1);
+         }
+         DP_TBFLAG_AM32(flags, THUMB, env->thumb);
+         DP_TBFLAG_AM32(flags, CONDEXEC, env->condexec_bits);
+ 
+-        tb = qatomic_read(&jc->array[h].tb);
+-        if (likely(tb && jc->array[h].pc == pc &&
+-                   tb->cs_base == flags.flags2 && tb->flags == flags.flags &&
+-                   tb_cflags(tb) == cflags)) {
++        if (likely(qatomic_read(&jc->array[h].tb) && jc->array[h].pc == pc &&
++                   jc->array[h].key == (flags.flags | (flags.flags2 << 32)))) {
+             cs->neg.can_do_io = true;
+-            return tb->tc.ptr;
++            return jc->array[h].ptr;
+         }
+     }
+ #endif
+--- a/target/arm/tcg/translate.h
++++ b/target/arm/tcg/translate.h
+@@ -93,6 +93,7 @@
+     int max_svl;     /* maximum implemented streaming vector length */
+     int max_any_vl;  /* maximum implemented vector length */
+     bool vfp_enabled; /* FP enabled via FPSCR.EN */
++    bool fastfp; /* Shadowgun: TBFLAG_A32.FASTFP and not QEMU_STRICT_FP */
+     int vec_len;
+     int vec_stride;
+     bool v7m_handler_mode;
+--- a/target/arm/tcg/vec_helper.c
++++ b/target/arm/tcg/vec_helper.c
+@@ -151,6 +151,56 @@
+ }
+ 
+ /*
++ * Shadowgun: a whole 128-bit register at once. The same rule as neon_f32_host(), tested on four lanes with
++ * integer vector compares: every operand plain, every result (and the product, for multiply-accumulate)
++ * settled. One lane failing sends the whole register through the per-element loop. The arithmetic is written
++ * in asm so that the compiler cannot contract multiply+add into a fused fmla.
++ */
++#include <arm_neon.h>
++
++static inline uint32x4_t v32_plain(uint32x4_t v)
++{
++    uint32x4_t m = vandq_u32(v, vdupq_n_u32(0x7fffffff));
++    return vorrq_u32(vceqzq_u32(m),
++                     vcleq_u32(vsubq_u32(m, vdupq_n_u32(0x00800000u)), vdupq_n_u32(0x7f000000u)));
++}
++
++static inline uint32x4_t v32_settled(uint32x4_t r)
++{
++    uint32x4_t m = vandq_u32(r, vdupq_n_u32(0x7fffffff));
++    return vcgeq_u32(vsubq_u32(m, vdupq_n_u32(1)), vdupq_n_u32(0x00800000u));
++}
++
++static inline uint32x4_t vhadd(uint32x4_t x, uint32x4_t y) { uint32x4_t r; asm("fadd %0.4s, %1.4s, %2.4s" : "=w"(r) : "w"(x), "w"(y)); return r; }
++static inline uint32x4_t vhsub(uint32x4_t x, uint32x4_t y) { uint32x4_t r; asm("fsub %0.4s, %1.4s, %2.4s" : "=w"(r) : "w"(x), "w"(y)); return r; }
++static inline uint32x4_t vhmul(uint32x4_t x, uint32x4_t y) { uint32x4_t r; asm("fmul %0.4s, %1.4s, %2.4s" : "=w"(r) : "w"(x), "w"(y)); return r; }
++
++static inline __attribute__((always_inline)) bool
++neon_f32x4_host(int kind, float32 *d, const float32 *n, uint32x4_t vm)
++{
++    uint32x4_t vn = vld1q_u32((const uint32_t *)n), vd, r;
++    uint32x4_t ok = vandq_u32(v32_plain(vn), v32_plain(vm));
++
++    switch (kind) {
++    case NF_ADD: r = vhadd(vn, vm); break;
++    case NF_SUB: r = vhsub(vn, vm); break;
++    case NF_MUL: r = vhmul(vn, vm); break;
++    default:
++        vd = vld1q_u32((const uint32_t *)d);
++        r = vhmul(vn, vm);
++        ok = vandq_u32(ok, vandq_u32(v32_plain(vd), v32_settled(r)));
++        r = kind == NF_MLA ? vhadd(vd, r) : vhsub(vd, r);
++        break;
++    }
++    ok = vandq_u32(ok, v32_settled(r));
++    if (unlikely(vminvq_u32(ok) != 0xffffffffu)) {
++        return false;
++    }
++    vst1q_u32((uint32_t *)d, r);
++    return true;
++}
++
++/*
+  * The rare element: computed the way the switching variant computes every element, with the host
+  * FPCR set to FZ+DN for this one operation and put back. Not softfloat: its float32_* entry points
+  * take this build's host-FPU shortcut, which is not exact at the smallest normal.
+@@ -182,6 +232,12 @@
+     float32 *d = vd, *n = vn, *m = vm;                                      \
+     if (neon_fast(stat)) {                                                  \
+         nova3_fpcr_default();                                               \
++        if (likely(oprsz == 16) &&                                          \
++            likely(neon_f32x4_host(NFK_##NAME, d, n,                        \
++                                   vld1q_u32((const uint32_t *)m)))) {      \
++            clear_tail(d, oprsz, simd_maxsz(desc));                         \
++            return;                                                         \
++        }                                                                   \
+         for (i = 0; i < oprsz / 4; i++) {                                   \
+             float32 r;                                                      \
+             if (likely(neon_f32_host(NFK_##NAME, d[i], n[i], m[i], &r))) {  \
+@@ -1693,16 +1749,48 @@
+ DO_3OP(gvec_ah_fabd_s, float32_ah_abd, float32)
+ DO_3OP(gvec_ah_fabd_d, float64_ah_abd, float64)
+ 
++/*
++ * Shadowgun: Neon f32 compares and min/max on the host for a 128-bit register whose operands are all plain
++ * (no NaN, no denormal): there the standard FPSCR's flush-to-zero and default NaN have nothing to do and the
++ * host instruction gives the same answer, +0/-0 ordering included. Anything else takes the softfloat loop.
++ */
++#if defined(__aarch64__) && defined(NOVA3_NEON_NOFPCR)
++#define SG_3OP_PLAIN_S(NAME, SOFT, VEXPR)                                   \
++void HELPER(NAME)(void *vd, void *vn, void *vm,                             \
++                  float_status *stat, uint32_t desc)                        \
++{                                                                           \
++    intptr_t i, oprsz = simd_oprsz(desc);                                   \
++    float32 *d = vd, *n = vn, *m = vm;                                      \
++    if (likely(oprsz == 16) && neon_fast(stat)) {                           \
++        uint32x4_t un = vld1q_u32(vn), um = vld1q_u32(vm);                  \
++        if (likely(vminvq_u32(vandq_u32(v32_plain(un), v32_plain(um)))      \
++                   == 0xffffffffu)) {                                       \
++            float32x4_t fn = vreinterpretq_f32_u32(un);                     \
++            float32x4_t fm = vreinterpretq_f32_u32(um);                     \
++            vst1q_u32(vd, VEXPR);                                           \
++            clear_tail(d, oprsz, simd_maxsz(desc));                         \
++            return;                                                         \
++        }                                                                   \
++    }                                                                       \
++    for (i = 0; i < oprsz / 4; i++) {                                       \
++        d[i] = SOFT(n[i], m[i], stat);                                      \
++    }                                                                       \
++    clear_tail(d, oprsz, simd_maxsz(desc));                                 \
++}
++#else
++#define SG_3OP_PLAIN_S(NAME, SOFT, VEXPR) DO_3OP(NAME, SOFT, float32)
++#endif
++
+ DO_3OP(gvec_fceq_h, float16_ceq, float16)
+-DO_3OP(gvec_fceq_s, float32_ceq, float32)
++SG_3OP_PLAIN_S(gvec_fceq_s, float32_ceq, vceqq_f32(fn, fm))
+ DO_3OP(gvec_fceq_d, float64_ceq, float64)
+ 
+ DO_3OP(gvec_fcge_h, float16_cge, float16)
+-DO_3OP(gvec_fcge_s, float32_cge, float32)
++SG_3OP_PLAIN_S(gvec_fcge_s, float32_cge, vcgeq_f32(fn, fm))
+ DO_3OP(gvec_fcge_d, float64_cge, float64)
+ 
+ DO_3OP(gvec_fcgt_h, float16_cgt, float16)
+-DO_3OP(gvec_fcgt_s, float32_cgt, float32)
++SG_3OP_PLAIN_S(gvec_fcgt_s, float32_cgt, vcgtq_f32(fn, fm))
+ DO_3OP(gvec_fcgt_d, float64_cgt, float64)
+ 
+ DO_3OP(gvec_facge_h, float16_acge, float16)
+@@ -1714,11 +1802,11 @@
+ DO_3OP(gvec_facgt_d, float64_acgt, float64)
+ 
+ DO_3OP(gvec_fmax_h, float16_max, float16)
+-DO_3OP(gvec_fmax_s, float32_max, float32)
++SG_3OP_PLAIN_S(gvec_fmax_s, float32_max, vreinterpretq_u32_f32(vmaxq_f32(fn, fm)))
+ DO_3OP(gvec_fmax_d, float64_max, float64)
+ 
+ DO_3OP(gvec_fmin_h, float16_min, float16)
+-DO_3OP(gvec_fmin_s, float32_min, float32)
++SG_3OP_PLAIN_S(gvec_fmin_s, float32_min, vreinterpretq_u32_f32(vminq_f32(fn, fm)))
+ DO_3OP(gvec_fmin_d, float64_min, float64)
+ 
+ DO_3OP(gvec_fmaxnum_h, float16_maxnum, float16)
+@@ -1966,6 +2054,12 @@
+     const bool fast = neon_fast(stat);                                      \
+     if (fast) {                                                             \
+         nova3_fpcr_default();                                               \
++        if (likely(oprsz == 16) &&                                          \
++            likely(neon_f32x4_host(NFK_##NAME, d, n,                        \
++                                   vdupq_n_u32(m[H4(idx)])))) {             \
++            clear_tail(d, oprsz, simd_maxsz(desc));                         \
++            return;                                                         \
++        }                                                                   \
+     }                                                                       \
+     for (i = 0; i < oprsz / 4; i += segment) {                              \
+         float32 mm = m[H4(i + idx)];                                        \
+--- a/accel/tcg/tb-jmp-cache.h
++++ b/accel/tcg/tb-jmp-cache.h
+@@ -32,6 +32,13 @@
+     struct {
+         TranslationBlock *tb;
+         vaddr pc;
++        /*
++         * Shadowgun: what a hit needs from the TB, copied here by the CPU that owns the cache when it
++         * fills the entry, so the indirect-branch fast path does not have to touch the TB itself (a second
++         * dependent load that usually misses L1). key is tb->flags | tb->cs_base << 32.
++         */
++        uint64_t key;
++        const void *ptr;
+     } array[TB_JMP_CACHE_SIZE];
+ } CPUJumpCache;
+ 
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -254,6 +254,8 @@
+     }
+ 
+     jc->array[hash].pc = s.pc;
++    jc->array[hash].key = tb->flags | (tb->cs_base << 32);
++    jc->array[hash].ptr = tb->tc.ptr;
+     qatomic_set(&jc->array[hash].tb, tb);
+ 
+ hit:
+@@ -982,6 +984,8 @@
+                 h = tb_jmp_cache_hash_func(s.pc);
+                 jc = cpu->tb_jmp_cache;
+                 jc->array[h].pc = s.pc;
++                jc->array[h].key = tb->flags | (tb->cs_base << 32);
++                jc->array[h].ptr = tb->tc.ptr;
+                 qatomic_set(&jc->array[h].tb, tb);
+             }
+ 

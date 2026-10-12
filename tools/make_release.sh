@@ -10,7 +10,7 @@ set -euo pipefail
 P=${NOVA3_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 source "$P/env.sh"
 cd "$P"
-Q="$P/qemu/out/qemu-arm-${NOVA3_QEMU_VARIANT:-D}.stripped"
+Q="$P/qemu/out/qemu-arm-${NOVA3_QEMU_VARIANT:-F}.stripped"
 VER=$(grep -o 'versionName="[^"]*"' port/android/AndroidManifest.xml | head -1 | cut -d'"' -f2)
 OUT="$P/release/$VER"
 rm -rf "$OUT"; mkdir -p "$OUT"

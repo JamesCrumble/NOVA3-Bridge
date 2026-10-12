@@ -20,6 +20,26 @@ QEMU 11.1.2 with `nova3-qemu-11.1.2.patch`. The patch, all of it Android/Oryon-s
 `android/patch_syscalls.py` additionally rewrites set_robust_list/rseq/faccessat2 call sites in the
 static glibc for the seccomp filter.
 
+## Variant F (default since the frame-limit release)
+
+Variant D plus `patches/neon_nofpcr.patch` (Neon f32 without switching FPCR, flag `-DNOVA3_NEON_NOFPCR`) plus
+`patches/fast_fp_inline.patch`, developed in the Shadowgun Bridge project on the same source tree:
+
+- new TCG ops hfadd/hfsub/hfmul/hfdiv (aarch64 host, V30 reserved): scalar VFP add/sub/mul/div are emitted as
+  fmov/op/fmov instead of a helper call, in TBs translated with the dynamic flag TBFLAG_A32.FASTFP (FPSCR: round to
+  nearest, no FZ, no DN). Off with `QEMU_STRICT_FP=1` or `SHADOWGUN_INLINE_FP=0`;
+- Neon f32 add/sub/mul/mla/mls (vector and by-scalar), vceq/vcge/vcgt and vmax/vmin on a whole 128-bit register
+  with host Neon when every lane is plain, else the per-element path;
+- inline NZCV(Q) writes and VCMP/VCMPE, `vfp_*` helpers TCG_CALL_NO_RWG, cross-page direct TB chaining;
+- jump-cache entries carry the TB's flags key and code pointer, so a hit in `helper_arm_lookup_tb_ptr` does not
+  read the TB;
+- the hardening flags (-ftrivial-auto-var-init, -fzero-call-used-regs) are removed from meson.build.
+
+Built with `build_variant.sh` and
+`-DNOVA3_JMP_BITS=16 -DNOVA3_FAST_LOOKUP -DNOVA3_NEON_NOFPCR -O3 -march=armv8.2-a+lse+rcpc+dotprod -mtune=neoverse-v1`.
+armbench on the phone: vfp 200 -> 160 ms, neon 48 -> 28 ms. Tests `fptest.c`, `cmptest.c`, `neontest.c`,
+`neoncmptest.c` give the same hashes as `QEMU_STRICT_FP=1`. `NOVA3_QEMU_VARIANT=D` builds the APK with the old one.
+
 ## Build (Docker, from the WSL host)
 
 ```sh
