@@ -35,14 +35,16 @@ The rest of this page is in Russian.
 Готовая сборка лежит на странице [Releases](https://github.com/JamesCrumble/NOVA3-Bridge/releases):
 `NOVA3-Bridge-<версия>.apk` и `INSTALL.txt`.
 
-1. Установите APK (пакет `com.jamescrumble.nova3`).
-2. Положите оригинальный APK игры 1.0.7 в `/sdcard/Android/data/com.jamescrumble.nova3/files/`.
-3. Положите `main.1050.com.gameloft.android.ANMP.GloftN3HM.obb` и `patch.1070.com.gameloft.android.ANMP.GloftN3HM.obb`
-   в `/sdcard/Android/obb/com.jamescrumble.nova3/`.
-4. Откройте приложение, при необходимости поменяйте настройки и нажмите «Играть».
+1. Установите APK (пакет `com.jamescrumble.nova3`), запустите один раз и закройте: появится папка
+   `/sdcard/Android/data/com.jamescrumble.nova3/files/`.
+2. Положите в неё два файла как есть: оригинальный APK игры 1.0.7 и zip-архив с её кэшем. Имена не важны.
+3. Откройте приложение, при необходимости поменяйте настройки и нажмите «Играть».
 
-Первый запуск дольше обычного: распаковываются sysroot (~100 МБ) и библиотеки игры. Если что-то не так, причина
-пишется на экране и в `nova3.log` в папке с файлами игры.
+Первый запуск долгий: из архива распаковываются оба файла `.obb` (около 2,3 ГБ), затем sysroot (~100 МБ) и
+библиотеки игры. Если что-то не так, причина пишется на экране и в `nova3.log` в той же папке.
+
+Вместо архива можно положить туда же два готовых файла `.obb` (`main.1050…` и `patch.1070…`); по-прежнему
+подходит и папка `/sdcard/Android/obb/com.jamescrumble.nova3/`.
 
 **Обновление со старого имени пакета.** До версии 0.3 пакет назывался иначе, и для Android это другое приложение:
 поверх оно не обновится. Прогресс переносится так: сборка `APP_ID=<старый пакет> tools/build_install.sh noinstall`

@@ -5,24 +5,21 @@ N.O.V.A. 3 (Gameloft, v1.0.7, только 32-бит) на 64-битном те�
 
 1. Установить NOVA3-Bridge-<версия>.apk (приложение "N.O.V.A. 3", пакет com.jamescrumble.nova3).
 
-2. Положить файлы игры (по adb или любым файловым менеджером):
+2. Запустить приложение один раз и закрыть: появится папка
 
    /sdcard/Android/data/com.jamescrumble.nova3/files/
-       N-O-V-A-3-Near-Orbit-Vanguard-Alliance-v1-0-7.apk      (оригинальный APK игры)
 
-   /sdcard/Android/obb/com.jamescrumble.nova3/
-       main.1050.com.gameloft.android.ANMP.GloftN3HM.obb
-       patch.1070.com.gameloft.android.ANMP.GloftN3HM.obb
+   Положить в неё два файла как есть (по кабелю с компьютера или файловым менеджером):
 
-   Пример:
-       adb push N-O-V-A-3-Near-Orbit-Vanguard-Alliance-v1-0-7.apk /sdcard/Android/data/com.jamescrumble.nova3/files/
-       adb shell mkdir -p /sdcard/Android/obb/com.jamescrumble.nova3
-       adb push main.1050.com.gameloft.android.ANMP.GloftN3HM.obb /sdcard/Android/obb/com.jamescrumble.nova3/
-       adb push patch.1070.com.gameloft.android.ANMP.GloftN3HM.obb /sdcard/Android/obb/com.jamescrumble.nova3/
+       <оригинальный APK игры 1.0.7>.apk       (не устанавливать, просто файлом)
+       <zip-архив с кэшем игры>.zip            (не распаковывать)
+
+   Имена файлов не важны, важны расширения. Вместо архива можно положить туда же два файла .obb
+   (main.1050... и patch.1070...); подходит и папка /sdcard/Android/obb/com.jamescrumble.nova3/.
 
 3. Открыть приложение: сначала появятся настройки (угол обзора, разрешение, качество, ядра),
-   кнопка "Играть" запускает игру. Первый запуск дольше: распаковывается sysroot (~100 МБ)
-   и ассеты игры.
+   кнопка "Играть" запускает игру. Первый запуск долгий: распаковываются кэш (около 2,3 ГБ)
+   и sysroot (~100 МБ).
 
 Исходники - NOVA3-Bridge-<версия>-src.zip (сборка описана в README.md и port/android/README.md).
 Контрольные суммы - SHA256SUMS.

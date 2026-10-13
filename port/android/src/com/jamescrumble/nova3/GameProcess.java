@@ -228,11 +228,24 @@ final class GameProcess {
         listener.onStatus("Извлечение libNOVA3_neon.so…");
         extractNative(apk, new File(libDir, "libNOVA3_neon.so"));
 
+        // The game data: the two OBBs. Simplest for the player is the cache zip next to the game APK, which is
+        // unpacked here once; OBBs already lying there or in Android/obb/<package>/ are used as they are.
         File obbSrc = ctx.getObbDir();
         obbSrc.mkdirs();
         File[] obbs = obbSrc.listFiles((d, n) -> n.endsWith(".obb"));
+        if ((obbs == null || obbs.length == 0) && external != null) {
+            obbs = external.listFiles((d, n) -> n.endsWith(".obb"));
+            if (obbs == null || obbs.length == 0) {
+                File zip = firstWithSuffix(external, ".zip");
+                if (zip != null) {
+                    extractObbs(zip, external);
+                    obbs = external.listFiles((d, n) -> n.endsWith(".obb"));
+                }
+            }
+        }
         if (obbs == null || obbs.length == 0) {
-            throw new IOException("Не найдены OBB-файлы (main и patch).\nПоложите их в папку:\n" + obbSrc.getPath());
+            throw new IOException("Не найдены данные игры.\nПоложите zip-архив с кэшем (или два файла .obb: main и patch)\nрядом с APK игры, в папку:\n"
+                    + (external == null ? obbSrc.getPath() : external.getPath()));
         }
         File obbDst = new File(game, OBB_DIR);
         obbDst.mkdirs();
@@ -492,6 +505,37 @@ final class GameProcess {
             if (out.exists() && out.length() == e.getSize()) return;
             copy(z.getInputStream(e), new FileOutputStream(out));
         }
+    }
+
+    /** Every *.obb of a cache zip into dir, whatever folder it sits in inside the archive. */
+    private void extractObbs(File zip, File dir) throws IOException {
+        int count = 0;
+        try (ZipFile z = new ZipFile(zip)) {
+            java.util.Enumeration<? extends ZipEntry> en = z.entries();
+            while (en.hasMoreElements()) {
+                ZipEntry e = en.nextElement();
+                String n = e.getName();
+                if (e.isDirectory() || !n.endsWith(".obb")) continue;
+                String name = n.substring(n.lastIndexOf('/') + 1);
+                File out = new File(dir, name), tmp = new File(dir, name + ".part");
+                long total = e.getSize(), done = 0, shown = -1;
+                try (InputStream in = z.getInputStream(e); OutputStream os = new FileOutputStream(tmp)) {
+                    byte[] buf = new byte[1 << 20];
+                    for (int r; (r = in.read(buf)) > 0; ) {
+                        os.write(buf, 0, r);
+                        done += r;
+                        long pct = total > 0 ? done * 100 / total : 0;
+                        if (pct != shown) {
+                            shown = pct;
+                            listener.onStatus("Распаковка кэша: " + name + " " + pct + "%");
+                        }
+                    }
+                }
+                if (!tmp.renameTo(out)) throw new IOException("Не удалось записать " + out.getPath());
+                count++;
+            }
+        }
+        if (count == 0) throw new IOException("В zip нет файлов .obb\nНужен кэш игры 1.0.7: " + zip.getName());
     }
 
     // The OBBs are over 2 GB; a symlink saves copying them into private storage.

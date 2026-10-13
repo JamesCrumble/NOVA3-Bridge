@@ -26,3 +26,5 @@ __pycache__/
 /release/
 /port/android/build/release.*
 release.pass
+# Game files are the player's own (never committed)
+/gamebin/
