@@ -93,6 +93,8 @@ The rest of this page is in Russian.
 
 Подробный журнал разработки, выводы и тупиковые ветки — в [PROJECT_STATE.md](PROJECT_STATE.md), история версий —
 в [CHANGELOG.md](CHANGELOG.md), архитектура обёртки — в [port/android/README.md](port/android/README.md).
+Пошаговый разбор — что было видно, как нашли причину, что исправили — в
+[docs/PORTING_GUIDE.md](docs/PORTING_GUIDE.md) ([English](docs/PORTING_GUIDE.en.md)).
 
 ## Производительность
 
