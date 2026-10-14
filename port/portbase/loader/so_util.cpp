@@ -980,14 +980,26 @@ void rehook_new(so_module *mod, ReentrantHook *hook, uintptr_t addr, uintptr_t d
   rehook_unhook(hook);
 }
 
+// The hooked function has just run, so qemu has write-protected its page to watch for
+// self-modifying code. On some devices (a Mali-G57 phone) the store then reaches the game as
+// SIGSEGV instead of being let through; an explicit mprotect drops qemu's translations of the
+// page and makes it writable for qemu itself. It is needed before every store, as each call of
+// the original translates the page again.
+static void rehook_write(uintptr_t addr, const void *words, size_t sz)
+{
+  uintptr_t lo = addr & ~(uintptr_t)4095;
+  uintptr_t hi = (addr + sz + 4095) & ~(uintptr_t)4095;
+  mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE | PROT_EXEC);
+  memcpy((void *)addr, words, sz);
+  __builtin___clear_cache((void *)addr, (void *)(addr + sz));
+}
+
 void rehook_hook(ReentrantHook *hook)
 {
-  memcpy((void *)hook->addr, (void *)hook->trampoline, sizeof(hook->trampoline));
-  __builtin___clear_cache((void *)hook->addr, (void *)hook->addr+sizeof(hook->trampoline));
+  rehook_write(hook->addr, hook->trampoline, sizeof(hook->trampoline));
 }
 
 void rehook_unhook(ReentrantHook *hook)
 {
-  memcpy((void *)hook->addr, (void *)hook->prologue, sizeof(hook->prologue));
-  __builtin___clear_cache((void *)hook->addr, (void *)hook->addr+sizeof(hook->prologue));
+  rehook_write(hook->addr, hook->prologue, sizeof(hook->prologue));
 }

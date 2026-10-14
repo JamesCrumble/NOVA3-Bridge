@@ -167,6 +167,11 @@ Do not add SVE to `-march`: Oryon has none, and the result is SIGILL.
   `mprotect` before the store (qemu makes them writable and drops their translations), and the replacement is
   skipped if that is refused. Rule: once a module has started running, write into its code only after your
   own `mprotect`, and check what it returns.
+- **Pitfall (0.7):** the rule also covers hooks that write into code on every call (`rehook_unhook` → call the
+  original → `rehook_hook`, used by the XML and field-of-view hooks). Calling the original translates the page
+  again and qemu protects it again, so a single `mprotect` at install time is not enough: on the same
+  Mali-G57 phone 0.6 crashed on the first XML parse. The `mprotect` now comes before every store —
+  [so_util.cpp](../port/portbase/loader/so_util.cpp).
 
 The same file holds physics on its own thread (under qemu every guest thread is a separate host core) and a
 custom field of view.
