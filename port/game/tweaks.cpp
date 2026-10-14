@@ -121,8 +121,31 @@ static void install_fast_cas(so_module *mod)
     }
     memcpy(page, code, sizeof(code));
     uint32_t *w = (uint32_t *)mod->text_base;
-    size_t n = mod->text_size / 4, hits = 0;
+    size_t n = mod->text_size / 4, hits = 0, first = n, last = 0;
     for (size_t i = 0; i < n; i++) {
+        if (w[i] == 0xffff0fc0u) {
+            if (first == n)
+                first = i;
+            last = i;
+        }
+    }
+    if (first == n) {
+        trace("tweaks: no kuser cmpxchg literal found");
+        return;
+    }
+    /* The literals sit next to the __sync_* functions, which the static initialisers have already
+     * run, so qemu has write-protected that page to watch for self-modifying code. On some devices
+     * (a Mali-G57 phone) the first store there came back as a guest SIGSEGV instead of being let
+     * through. An explicit mprotect makes the page writable for qemu itself and drops its
+     * translations; if even that is refused, the speed-up is skipped rather than the game killed. */
+    uintptr_t lo = (uintptr_t)&w[first] & ~(uintptr_t)4095;
+    uintptr_t hi = ((uintptr_t)&w[last] + 4 + 4095) & ~(uintptr_t)4095;
+    if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        trace("tweaks: fast cas: mprotect %p..%p failed (errno %d), skipped", (void *)lo, (void *)hi, errno);
+        munmap(page, 4096);
+        return;
+    }
+    for (size_t i = first; i <= last; i++) {
         if (w[i] == 0xffff0fc0u) {
             w[i] = (uint32_t)(uintptr_t)page;
             hits++;

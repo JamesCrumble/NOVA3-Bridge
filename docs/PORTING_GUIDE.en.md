@@ -160,6 +160,13 @@ Do not add SVE to `-march`: Oryon has none, and the result is SIGILL.
   operations. qemu-user emulates it by leaving translated code on every call.
 - **Fix:** the literal holding that address is pointed at a small `ldrex/strex` routine —
   [tweaks.cpp](../port/game/tweaks.cpp). `NOVA3_FAST_CAS=0` turns it off.
+- **Pitfall (0.6):** all 43 literals sit next to the `__sync_*` functions themselves, which the static
+  constructors have already run. qemu-user write-protects pages that hold translated code and normally lets a
+  store into them through by itself. On one phone with a Mali-G57 MC2 the very first store (+0xbe6574) reached
+  the game as a SIGSEGV, while on the Adreno 830 everything worked. The pages are now opened explicitly with
+  `mprotect` before the store (qemu makes them writable and drops their translations), and the replacement is
+  skipped if that is refused. Rule: once a module has started running, write into its code only after your
+  own `mprotect`, and check what it returns.
 
 The same file holds physics on its own thread (under qemu every guest thread is a separate host core) and a
 custom field of view.
