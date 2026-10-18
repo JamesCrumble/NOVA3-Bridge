@@ -1,6 +1,7 @@
 package com.jamescrumble.nova3;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
@@ -37,10 +38,12 @@ public final class SettingsActivity extends Activity {
 
     private final Map<String, String> values = new LinkedHashMap<>();
     private float dp;
+    private TextView folderInfo;
+    private boolean hadAccess, asked;
 
+    /** The existing settings file (main folder first, then the other), or where it would be written. */
     static File file(Context c) {
-        File d = c.getExternalFilesDir(null);
-        return new File(d != null ? d : c.getFilesDir(), "settings.txt");
+        return Storage.find(c, "settings.txt");
     }
 
     static Map<String, String> load(Context c) {
@@ -63,7 +66,7 @@ public final class SettingsActivity extends Activity {
     private boolean save() {
         StringBuilder sb = new StringBuilder();
         for (Map.Entry<String, String> e : values.entrySet()) sb.append(e.getKey()).append('=').append(e.getValue()).append('\n');
-        try (FileOutputStream out = new FileOutputStream(file(this))) {
+        try (FileOutputStream out = new FileOutputStream(new File(Storage.mainDir(this), "settings.txt"))) {
             out.write(sb.toString().getBytes("UTF-8"));
             return true;
         } catch (IOException e) {
@@ -85,6 +88,9 @@ public final class SettingsActivity extends Activity {
 
         col.addView(text("N.O.V.A. 3 — настройки", 22, FG, true));
         col.addView(text("Настрой и нажми «Играть» — игра стартует с этими значениями.", 13, DIM, false));
+        folderInfo = text("", 12, DIM, false);
+        folderInfo.setPadding(0, px(6), 0, 0);
+        col.addView(folderInfo);
 
         col.addView(section("Картинка"));
         col.addView(slider("Угол обзора (FOV)", "NOVA3_FOV_PERCENT", 100, 220, 5, 160, " %",
@@ -128,7 +134,7 @@ public final class SettingsActivity extends Activity {
         Button reset = button("Вернуть как было");
         reset.setOnClickListener(v -> {
             values.clear();
-            file(this).delete();
+            Storage.deleteEverywhere(this, "settings.txt");
             recreate();
         });
         Button saveOnly = button("Сохранить");
@@ -151,6 +157,56 @@ public final class SettingsActivity extends Activity {
         root.addView(sv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         root.addView(bar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         setContentView(root);
+        hadAccess = Storage.hasAccess(this);
+        showFolder();
+        if (!hadAccess) askAccess();
+        else moveFiles();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        // Back from the system page: if the access has just been given, take the files over.
+        boolean now = Storage.hasAccess(this);
+        if (now && !hadAccess) moveFiles();
+        hadAccess = now;
+        showFolder();
+    }
+
+    @Override public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+        if (Storage.hasAccess(this)) { hadAccess = true; moveFiles(); }
+        showFolder();
+    }
+
+    private void showFolder() {
+        if (folderInfo == null) return;
+        File main = Storage.mainDir(this);
+        folderInfo.setText("Папка игры: " + main.getPath() + (Storage.hasAccess(this) ? ""
+                : "\n(нет доступа ко всем файлам — используется папка приложения в Android/data)"));
+    }
+
+    /** Asks once per launch of this screen for access to all files; the game works without it. */
+    private void askAccess() {
+        if (asked) return;
+        asked = true;
+        new AlertDialog.Builder(this)
+                .setTitle("Доступ ко всем файлам")
+                .setMessage("Чтобы хранить APK игры, кэш и сохранения в удобной папке\n"
+                        + Storage.shared(this).getPath() + "\nприложению нужен доступ ко всем файлам. Файлы из Android/data "
+                        + "будут перенесены туда сами. Без доступа игра работает с папкой в Android/data.")
+                .setPositiveButton("Разрешить", (d, w) -> Storage.requestAccess(this, 2))
+                .setNegativeButton("Позже", null)
+                .show();
+    }
+
+    /** Creates BridgeGames/<package> and moves the files of Android/data into it (off the UI thread: it may copy). */
+    private void moveFiles() {
+        new Thread(() -> {
+            int n = Storage.migrate(getApplicationContext(), t -> runOnUiThread(() -> folderInfo.setText(t)));
+            runOnUiThread(() -> {
+                showFolder();
+                if (n > 0) Toast.makeText(this, "Файлов перенесено в BridgeGames: " + n, Toast.LENGTH_LONG).show();
+            });
+        }, "bridge-storage").start();
     }
 
     /**

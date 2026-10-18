@@ -50,10 +50,11 @@ final class SaveMigration {
 
     /** New install: takes in a migrate folder placed in Android/data, once. Returns a log line, or null. */
     static String importIfPresent(Context ctx) {
-        File ext = ctx.getExternalFilesDir(null);
-        if (ext == null) return null;
-        File in = new File(ext, OUT);
-        if (!new File(in, DONE).isFile()) return null;
+        File ext = null, in = null;
+        for (File dir : Storage.sources(ctx)) {
+            if (new File(new File(dir, OUT), DONE).isFile()) { ext = dir; in = new File(dir, OUT); break; }
+        }
+        if (in == null) return null;
         try {
             int n = 0;
             for (String d : DIRS) {

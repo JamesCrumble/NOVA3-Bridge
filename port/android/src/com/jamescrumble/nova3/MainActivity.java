@@ -118,9 +118,8 @@ public final class MainActivity extends Activity {
 
         if (attach) {
             if (phase == Phase.PLAYING) game.setMuted(false);
-        } else if (Build.VERSION.SDK_INT < 30
-                && checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[] { Manifest.permission.READ_EXTERNAL_STORAGE }, 1);
+        } else if (Build.VERSION.SDK_INT < 30 && Storage.runtimePermissions(this, false).length > 0) {
+            requestPermissions(Storage.runtimePermissions(this, false), 1);
         } else {
             startGame();
         }
