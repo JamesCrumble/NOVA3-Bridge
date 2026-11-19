@@ -2,14 +2,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SDK="${ANDROID_SDK_ROOT:-$ROOT/../android-sdk}"
+tp() { [ -e "$ROOT/../${2:-$1}" ] && echo "$ROOT/../${2:-$1}" || echo "${SHARED_3P:-$ROOT/../../__shared-third-party__}/$1"; }  # third-party: this project first, then ../__shared-third-party__
+SDK="${ANDROID_SDK_ROOT:-$(tp android-sdk)}"
 BT="$SDK/build-tools/34.0.0"
 PLATFORM="$SDK/platforms/android-34/android.jar"
 OUT="$ROOT/android/build/apk"
 # QEMU_BIN: the static aarch64 qemu-arm to ship. Default: our patched build (../qemu/out, tools/qemu_build.sh),
 # else Debian's qemu-user-static.
 QEMU="${QEMU_BIN:-$ROOT/../qemu/out/qemu-arm-D.stripped}"
-[ -x "$QEMU" ] || QEMU="$ROOT/../downloads/qemu-debian/qemu-arm-static"
+[ -x "$QEMU" ] || QEMU="$(tp downloads)/qemu-debian/qemu-arm-static"
 
 if [ ! -x "$BT/aapt2" ] || [ ! -f "$PLATFORM" ]; then
     echo "Android SDK build-tools 34.0.0 and platform 34 are required" >&2

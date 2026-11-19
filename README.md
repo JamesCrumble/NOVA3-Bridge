@@ -154,11 +154,11 @@ AArch64-хост (подробно в [qemu/README.md](qemu/README.md)):
 
 Сборка идёт в WSL (Ubuntu).
 
-Нужны, кладутся в корень проекта и в git не входят:
+Нужны (в git не входят; `jdk`, `android-sdk`, `sdl-arm` лежат в общей папке `../__shared-third-party__`, её используют все проекты; если такая папка есть в корне проекта, приоритет у неё — так ищут и `env.sh`, и скрипты):
 
-- `jdk/` — JDK 17;
-- `android-sdk/` — build-tools 34.0.0, platform 34, platform-tools;
-- `sdl-arm/` — SDL2 под armhf;
+- `../__shared-third-party__/jdk/` — JDK 17;
+- `../__shared-third-party__/android-sdk/` — build-tools 34.0.0, platform 34, platform-tools;
+- `../__shared-third-party__/sdl-arm/` — SDL2 под armhf;
 - системный armhf-тулчейн (`gcc-arm-linux-gnueabihf`, `g++-arm-linux-gnueabihf`) и Docker для qemu;
 - `port/gamebin/` — ваш APK игры, `nova3data/` — её OBB (нужны скрипту релиза и для запуска на ПК).
 
@@ -173,12 +173,12 @@ tools/make_release.sh              # релизный APK, архив исход
 
 ### qemu
 
-Исходники QEMU 11.1.2 распаковываются в `qemu-src/qemu-11.1.2` (`tools/qemu_fetch.sh`), на них по порядку
+Исходники QEMU 11.1.2 распаковываются в `../__shared-third-party__/qemu-src/nova3probe/qemu-11.1.2` (`tools/qemu_fetch.sh`), на них по порядку
 накладываются `qemu/patches/nova3.patch`, `neon_nofpcr.patch` и `fast_fp_inline.patch`.
 
 ```sh
 docker build -t nova3-qemu-build qemu
-docker run --rm -u 1000:1000 -e HOME=/tmp -v "$PWD":/work nova3-qemu-build \
+docker run --rm -u 1000:1000 -e HOME=/tmp -v "$PWD":/work -v "$PWD/../__shared-third-party__/qemu-src/$(basename "$PWD")":/qemu-src nova3-qemu-build \
   bash /work/qemu/build_variant.sh F \
   '-DNOVA3_JMP_BITS=16 -DNOVA3_FAST_LOOKUP -DNOVA3_NEON_NOFPCR -O3 -march=armv8.2-a+lse+rcpc+dotprod -mtune=neoverse-v1'
 ```

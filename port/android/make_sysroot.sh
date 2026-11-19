@@ -5,8 +5,9 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tp() { [ -e "$REPO/../${2:-$1}" ] && echo "$REPO/../${2:-$1}" || echo "${SHARED_3P:-$REPO/../../__shared-third-party__}/$1"; }  # third-party: this project first, then ../__shared-third-party__
 OUT="$REPO/android/build/sysroot"
-LIBDIRS=("$REPO/build/sdl-arm/lib" /lib/arm-linux-gnueabihf /usr/lib/arm-linux-gnueabihf /usr/arm-linux-gnueabihf/lib)
+LIBDIRS=("$(tp sdl-arm)/lib" /lib/arm-linux-gnueabihf /usr/lib/arm-linux-gnueabihf /usr/arm-linux-gnueabihf/lib)
 STRIP=arm-linux-gnueabihf-strip
 
 rm -rf "$OUT"

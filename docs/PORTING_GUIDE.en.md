@@ -56,6 +56,25 @@ Four Android restrictions, each of which took its own round:
 - **Fix:** the manifest has `debuggable=false`, with `profileable shell=true` kept for profiling. The same
   manifest declares `isGame` and a `game_mode_config` that supports performance mode.
 
+### 1.5. An Android API method that is missing on an older system
+
+- **Seen:** the log has `[gl] bridge thread died: java.lang.NoSuchMethodError: No static method
+  fcntlInt(Ljava/io/FileDescriptor;II)I in class Landroid/system/Os;`. The GLES bridge thread dies at
+  start-up and the game is left without a picture.
+- **Cause:** `Os.fcntlInt` appeared in API 30 (Android 11); `api-versions.xml` lists it with `since="30"`.
+  The APK is built against `android-34/android.jar` with `minSdk` 26, so the compiler says nothing, while a
+  phone with an older system does not have the method. `NoSuchMethodError` is an `Error`, not an
+  `Exception`, and `catch (ErrnoException ...)` does not catch it: it travels to the top of the thread.
+- **Fix:** the `F_SETPIPE_SZ` call in [GlBridge.java](../port/android/src/com/jamescrumble/nova3/GlBridge.java)
+  is wrapped in `if (Build.VERSION.SDK_INT >= 30)`. The bridge works without the enlarged pipe, only with
+  less room in the command queue. [GameProcess.java](../port/android/src/com/jamescrumble/nova3/GameProcess.java)
+  has had such a check for a long time (for audio); the bridge was the place where it was forgotten.
+- **Check in the log:** the line `[audio] ... pipe -1 bytes` means the version check skipped the call;
+  there is no `bridge thread died` line.
+- **How not to repeat it:** before using a method of `android.system.Os`, `android.os` and the like, check
+  its level: `grep -n 'method_name' $ANDROID_HOME/platforms/android-34/data/api-versions.xml`. If `since` is
+  above `minSdk` (26), a `SDK_INT` check is needed. Building against a newer `android.jar` will not show it.
+
 ## Part 2. The GLES bridge
 
 The game calls GLES 2.0, but there is no driver inside the guest. The calls land in the stubs of

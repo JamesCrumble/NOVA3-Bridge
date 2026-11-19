@@ -1,4 +1,5 @@
 #!/bin/sh
+tp() { [ -e "$P/${2:-$1}" ] && echo "$P/${2:-$1}" || echo "${SHARED_3P:-$P/../__shared-third-party__}/$1"; }  # third-party: this project first, then ../__shared-third-party__
 # Disassembles the donor APK's classes.dex into ~/nova3probe/donor/
 P=${NOVA3_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 set -e
@@ -10,6 +11,6 @@ echo "APK: $APK"
 cd $D
 python3 -c "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); [z.extract(n,'.') for n in z.namelist() if n.endswith('.dex')]" "$APK"
 ls -la $D
-$P/android-sdk/build-tools/34.0.0/dexdump -d classes.dex > classes.txt 2>/dev/null || true
+$(tp android-sdk)/build-tools/34.0.0/dexdump -d classes.dex > classes.txt 2>/dev/null || true
 wc -l classes.txt
 grep -n "Class descriptor" classes.txt | grep -i gameloft | head -60

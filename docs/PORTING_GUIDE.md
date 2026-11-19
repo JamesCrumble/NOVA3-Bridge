@@ -56,6 +56,25 @@ N.O.V.A. 3 — первый проект этого семейства. Здес
 - **Исправление:** в манифесте `debuggable=false`, для профилирования оставлено `profileable shell=true`.
   Там же `isGame` и `game_mode_config` с поддержкой режима производительности.
 
+### 1.5. Метод Android API, которого нет на старой системе
+
+- **Видно:** в логе `[gl] bridge thread died: java.lang.NoSuchMethodError: No static method
+  fcntlInt(Ljava/io/FileDescriptor;II)I in class Landroid/system/Os;`. Поток моста GLES умирает на старте,
+  игра остаётся без картинки.
+- **Причина:** `Os.fcntlInt` появился в API 30 (Android 11); в `api-versions.xml` у него `since="30"`.
+  APK собирается с `android-34/android.jar` и `minSdk` 26, поэтому компилятор молчит, а на телефоне с
+  более старой системой метода нет. `NoSuchMethodError` — это `Error`, а не `Exception`, и
+  `catch (ErrnoException ...)` его не ловит: исключение уходит в самый верх потока.
+- **Исправление:** вызов `F_SETPIPE_SZ` в [GlBridge.java](../port/android/src/com/jamescrumble/nova3/GlBridge.java)
+  обёрнут в `if (Build.VERSION.SDK_INT >= 30)`. Без увеличенного pipe мост работает, только с меньшим
+  запасом очереди команд. В [GameProcess.java](../port/android/src/com/jamescrumble/nova3/GameProcess.java)
+  такая проверка стояла давно (для звука), а в мосте её забыли.
+- **Проверка по логу:** строка `[audio] ... pipe -1 bytes` — вызов пропущен проверкой версии; строки
+  `bridge thread died` нет.
+- **Как не повторить:** перед использованием метода `android.system.Os`, `android.os` и т. п. проверить его
+  уровень: `grep -n 'имя_метода' $ANDROID_HOME/platforms/android-34/data/api-versions.xml`. Если `since` выше
+  `minSdk` (26), нужна проверка `SDK_INT`. Сборка против нового `android.jar` этого не покажет.
+
 ## Часть 2. Мост GLES
 
 Игра вызывает GLES 2.0, но драйвера внутри гостя нет. Вызовы попадают в заглушки

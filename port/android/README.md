@@ -93,7 +93,7 @@
 ```sh
 # WSL, из корня репозитория. Нужны: build/nova3 (порт), Android SDK build-tools 34.0.0 + platform 34,
 # JDK 8+ (javac), python3. QEMU_BIN — наш qemu-arm (см. qemu/README.md); без него берётся Debian 7.2.
-QEMU_BIN=/path/to/qemu-arm.stripped JAVA_HOME=/path/to/jdk bash android/build_apk.sh
+QEMU_BIN=/path/to/qemu-arm.stripped JAVA_HOME=../__shared-third-party__/jdk bash android/build_apk.sh
 ```
 
 Результат: `NOVA3-ARM32-debug.apk` в корне репозитория. Ключ отладочной подписи хранится в

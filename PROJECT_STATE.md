@@ -44,7 +44,7 @@ Oryon, только AArch64, Android/OxygenOS 15+), подключён по USB,
 - `launch.sh [install]` — установить и перезапустить игру. `adb` — обёртка над Windows adb.exe.
 - `pull_log.sh`, `grep_log.sh`, `fps.sh`, `cpu_diag.sh` (частоты/ядра/температуры), `profile.sh N` (simpleperf),
   `qemu_hot.py` (символизация qemu), `timeline.py` (FPS/нагрузка по логу), `log_digest.py`, `sync_ops.py`.
-- qemu: исходники `qemu-src/qemu-11.1.2`, Docker-образ `nova3-qemu-build` (`qemu-build/Dockerfile`),
+- qemu: исходники `../__shared-third-party__/qemu-src/nova3probe/qemu-11.1.2`, Docker-образ `nova3-qemu-build` (`qemu-build/Dockerfile`),
   сборка `docker run --rm -u 1000:1000 -e HOME=/tmp -v /home/james/nova3probe:/work nova3-qemu-build bash /work/qemu-build/build_lf.sh`,
   затем `tools/qemu_finish.sh` (strip), `tools/fptest.sh` (бит-в-бит тест float), патчи — `qemu-build/patches/nova3.patch`
   (`tools/qemu_patch_save.sh`). `android/patch_syscalls.py` переписывает set_robust_list/rseq/faccessat2 под seccomp.

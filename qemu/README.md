@@ -44,9 +44,9 @@ armbench on the phone: vfp 200 -> 160 ms, neon 48 -> 28 ms. Tests `fptest.c`, `c
 
 ```sh
 docker build -t nova3-qemu-build android/qemu
-# qemu source: download.qemu.org/qemu-11.1.2.tar.xz unpacked to <work>/qemu-src/qemu-11.1.2,
+# qemu source: download.qemu.org/qemu-11.1.2.tar.xz unpacked to ../__shared-third-party__/qemu-src/nova3probe/qemu-11.1.2 (mounted at /qemu-src in the container),
 # patched with: patch -p1 < android/qemu/nova3-qemu-11.1.2.patch
-docker run --rm -u 1000:1000 -e HOME=/tmp -v <work>:/work nova3-qemu-build bash /work/qemu-build/build_variant.sh D \
+docker run --rm -u 1000:1000 -e HOME=/tmp -v <work>:/work -v <work>/../__shared-third-party__/qemu-src/nova3probe:/qemu-src nova3-qemu-build bash /work/qemu-build/build_variant.sh D \
   '-DNOVA3_JMP_BITS=16 -DNOVA3_FAST_LOOKUP -O3 -march=armv8.2-a+lse+rcpc+dotprod -mtune=neoverse-v1'
 ```
 

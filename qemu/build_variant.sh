@@ -1,14 +1,18 @@
 #!/bin/bash
 # Inside the nova3-qemu-build container (~/nova3probe at /work): one qemu-arm variant per build dir.
+# Needs the qemu source tree mounted at /qemu-src (host: ../__shared-third-party__/qemu-src/<project>).
 # Usage: build_variant.sh NAME "EXTRA_CFLAGS"   -> /work/qemu/out/qemu-arm-NAME(.stripped)
 set -euo pipefail
 NAME=$1
 CF=${2:-}
 V=${V:-11.1.2}
-SRC=/work/qemu-src/qemu-$V
+SRC=/qemu-src/qemu-$V
 B=/work/qemu/obj-$NAME
 mkdir -p "$B" /work/qemu/out
 cd "$B"
+if [ -f build.ninja ] && grep -q -F '/work/qemu-src/' build.ninja; then
+  echo "$B was configured against the old /work/qemu-src path (sources now live in ../__shared-third-party__/qemu-src): rm -rf it and re-run" >&2; exit 1
+fi
 if [ ! -f build.ninja ]; then
   PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
   "$SRC/configure" \

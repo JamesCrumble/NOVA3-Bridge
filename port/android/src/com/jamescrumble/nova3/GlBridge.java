@@ -161,7 +161,9 @@ final class GlBridge implements Runnable {
         try {
             cmd = Os.open(cmdPath, OsConstants.O_RDWR | OsConstants.O_NONBLOCK, 0);
             rep = Os.open(repPath, OsConstants.O_RDWR, 0);
-            try { Os.fcntlInt(cmd, 1031 /* F_SETPIPE_SZ */, 1 << 20); } catch (ErrnoException ignored) { }
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                try { Os.fcntlInt(cmd, 1031 /* F_SETPIPE_SZ */, 1 << 20); } catch (ErrnoException ignored) { }
+            }
             initEgl();
             lastReport = System.nanoTime();
             loop();

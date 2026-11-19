@@ -1,9 +1,9 @@
-# Third-party toolchains, sources and downloads (fetched locally, never committed)
+# Third-party toolchains/sources/downloads: the project may hold a local copy (it takes precedence), by default they come from ../__shared-third-party__
 /android-sdk/
 /jdk/
+/sdl-arm/
 /downloads/
 /qemu-src/
-/sdl-arm/
 # Game data is the player's own (Gameloft), never the repo's
 /nova3data/
 # Runtime, logs, archives
