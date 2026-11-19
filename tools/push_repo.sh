@@ -12,9 +12,7 @@ git diff --cached --name-only | while read f; do [ -f "$f" ] && stat -c '%s %n' 
 git commit -q -m "Initial commit: NOVA3 Bridge
 
 N.O.V.A. 3 (ARM32) on 64-bit-only Android phones: patched qemu-user 11.1.2,
-GLES bridge to the phone GPU, Java APK wrapper, tools.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+GLES bridge to the phone GPU, Java APK wrapper, tools."
 git remote get-url origin >/dev/null 2>&1 || git remote add origin git@github.com:JamesCrumble/NOVA3-Bridge.git
 git push -u origin master 2>&1 | tail -3
 git log --oneline -1
